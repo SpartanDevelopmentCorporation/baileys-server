@@ -1,53 +1,167 @@
 import express from 'express';
-import { Telegraf } from 'telegraf';
 import QRCode from 'qrcode';
 import { createClient } from '@supabase/supabase-js';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
-const BAILEYS_DATA_DIR = process.env.BAILEYS_DATA_DIR || './baileys_auth';
+const API_KEY = process.env.API_KEY;
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS || '*';
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
   throw new Error('SUPABASE_URL y SUPABASE_KEY son requeridas');
 }
+if (!API_KEY) {
+  throw new Error('API_KEY es requerida');
+}
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// CORS Middleware - Permitir peticiones desde cualquier origen
+// CORS Middleware - Restringir orígenes permitidos
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
+  const origin = req.headers.origin;
+  if (ALLOWED_ORIGINS === '*') {
+    res.header('Access-Control-Allow-Origin', '*');
+  } else {
+    const allowed = ALLOWED_ORIGINS.split(',').map(o => o.trim());
+    if (origin && allowed.includes(origin)) {
+      res.header('Access-Control-Allow-Origin', origin);
+    }
+  }
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
-  
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, x-api-key');
+
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
   }
-  
+
   next();
 });
 
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
+// Auth Middleware - Validar API Key en todas las rutas excepto /health y /api/whatsapp/events (SSE usa query param)
+app.use((req, res, next) => {
+  if (req.path === '/health') return next();
+  if (req.path === '/api/whatsapp/events') return next();
+
+  const apiKey = req.headers['x-api-key'];
+  if (!apiKey || apiKey !== API_KEY) {
+    return res.status(401).json({ error: 'API key inválida o faltante' });
+  }
+  next();
+});
+
+// Normalizar número de teléfono: asegurar formato +E.164
+function normalizePhone(numero) {
+  return numero.startsWith('+') ? numero : `+${numero}`;
+}
+
 let sock = null;
 let currentQRCode = null;
 let activeSessions = {};
 
+// SSE - Server-Sent Events para actualizaciones en tiempo real
+const sseClients = new Set();
+
+function broadcast(event, data) {
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const client of sseClients) {
+    client.write(payload);
+  }
+}
+
+async function useSupabaseAuthState(sessionId) {
+  const { initAuthCreds, BufferJSON, proto } = await import('@whiskeysockets/baileys');
+
+  // Read creds from Supabase
+  const { data: credsRow } = await supabase
+    .from('baileys_auth_state')
+    .select('data_value')
+    .eq('session_id', sessionId)
+    .eq('data_key', 'creds')
+    .single();
+
+  const creds = credsRow?.data_value
+    ? JSON.parse(JSON.stringify(credsRow.data_value), BufferJSON.reviver)
+    : initAuthCreds();
+
+  const keys = {
+    get: async (type, ids) => {
+      const result = {};
+      if (!ids.length) return result;
+
+      const dataKeys = ids.map(id => `${type}-${id}`);
+      const { data } = await supabase
+        .from('baileys_auth_state')
+        .select('data_key, data_value')
+        .eq('session_id', sessionId)
+        .in('data_key', dataKeys);
+
+      for (const row of data || []) {
+        const id = row.data_key.replace(`${type}-`, '');
+        let value = JSON.parse(JSON.stringify(row.data_value), BufferJSON.reviver);
+        if (type === 'app-state-sync-key') {
+          value = proto.Message.AppStateSyncKeyData.fromObject(value);
+        }
+        result[id] = value;
+      }
+      return result;
+    },
+    set: async (data) => {
+      const rows = [];
+      for (const [type, entries] of Object.entries(data)) {
+        for (const [id, value] of Object.entries(entries)) {
+          const dataKey = `${type}-${id}`;
+          if (value) {
+            rows.push({
+              session_id: sessionId,
+              data_key: dataKey,
+              data_value: JSON.parse(JSON.stringify(value, BufferJSON.replacer)),
+              updated_at: new Date().toISOString(),
+            });
+          } else {
+            // Delete removed keys
+            await supabase
+              .from('baileys_auth_state')
+              .delete()
+              .eq('session_id', sessionId)
+              .eq('data_key', dataKey);
+          }
+        }
+      }
+      if (rows.length) {
+        await supabase
+          .from('baileys_auth_state')
+          .upsert(rows, { onConflict: 'session_id,data_key' });
+      }
+    },
+  };
+
+  const saveCreds = async () => {
+    await supabase
+      .from('baileys_auth_state')
+      .upsert({
+        session_id: sessionId,
+        data_key: 'creds',
+        data_value: JSON.parse(JSON.stringify(creds, BufferJSON.replacer)),
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'session_id,data_key' });
+  };
+
+  return { state: { creds, keys }, saveCreds };
+}
+
 async function initBaileys() {
   try {
-    const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = 
+    const { default: makeWASocket, DisconnectReason } =
       await import('@whiskeysockets/baileys');
 
     console.log('Baileys importado correctamente');
-    return { makeWASocket, useMultiFileAuthState, DisconnectReason };
+    return { makeWASocket, DisconnectReason };
   } catch (error) {
     console.error('Error importando Baileys:', error);
     throw error;
@@ -56,17 +170,12 @@ async function initBaileys() {
 
 async function startWhatsAppSession(numero) {
   try {
-    const { makeWASocket, useMultiFileAuthState, DisconnectReason } = 
+    const { makeWASocket, DisconnectReason } =
       await initBaileys();
-
-    const sessionDir = path.join(BAILEYS_DATA_DIR, numero);
-    if (!fs.existsSync(sessionDir)) {
-      fs.mkdirSync(sessionDir, { recursive: true });
-    }
 
     console.log(`Iniciando sesión para ${numero}...`);
 
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+    const { state, saveCreds } = await useSupabaseAuthState(numero);
 
     const sock = makeWASocket({
       auth: state,
@@ -96,6 +205,7 @@ async function startWhatsAppSession(numero) {
             })
             .eq('display_phone_number', numero);
 
+          broadcast('qr_update', { account: numero });
         } catch (err) {
           console.error('Error generando QR:', err);
         }
@@ -118,6 +228,7 @@ async function startWhatsAppSession(numero) {
           })
           .eq('display_phone_number', numero);
 
+        broadcast('connection_update', { account: numero, status: 'connected' });
         await syncContactos(numero, sock);
       }
 
@@ -138,6 +249,8 @@ async function startWhatsAppSession(numero) {
             connection_status: 'close'
           })
           .eq('display_phone_number', numero);
+
+        broadcast('connection_update', { account: numero, status: 'disconnected' });
       }
     });
 
@@ -327,6 +440,13 @@ async function guardarMensaje(numero, message) {
       })
       .eq('id', conversationId);
 
+    // Notificar a clientes SSE del nuevo mensaje
+    broadcast('new_message', {
+      account: numero,
+      contact_phone: fullPhone,
+      conversation_id: conversationId,
+    });
+
   } catch (error) {
     console.error('Error guardando mensaje:', error);
   }
@@ -344,7 +464,7 @@ async function getUnreadCount(conversationId) {
 }
 
 app.get('/api/whatsapp/qr/:numero', async (req, res) => {
-  const { numero } = req.params;
+  const numero = normalizePhone(req.params.numero);
 
   try {
     const { data } = await supabase
@@ -368,7 +488,7 @@ app.get('/api/whatsapp/qr/:numero', async (req, res) => {
 });
 
 app.post('/api/whatsapp/connect/:numero', async (req, res) => {
-  const { numero } = req.params;
+  const numero = normalizePhone(req.params.numero);
 
   try {
     const { data } = await supabase
@@ -393,7 +513,7 @@ app.post('/api/whatsapp/connect/:numero', async (req, res) => {
 });
 
 app.get('/api/whatsapp/status/:numero', async (req, res) => {
-  const { numero } = req.params;
+  const numero = normalizePhone(req.params.numero);
 
   try {
     const { data } = await supabase
@@ -417,7 +537,7 @@ app.get('/api/whatsapp/status/:numero', async (req, res) => {
 });
 
 app.get('/api/whatsapp/mensajes/:numero', async (req, res) => {
-  const { numero } = req.params;
+  const numero = normalizePhone(req.params.numero);
   const { contacto, limite = 50 } = req.query;
 
   try {
@@ -458,7 +578,8 @@ app.get('/api/whatsapp/mensajes/:numero', async (req, res) => {
 });
 
 app.post('/api/whatsapp/enviar', async (req, res) => {
-  const { numero, contacto, mensaje } = req.body;
+  const numero = normalizePhone(req.body.numero || '');
+  const { contacto, mensaje } = req.body;
 
   if (!numero || !contacto || !mensaje) {
     return res.status(400).json({ 
@@ -539,7 +660,7 @@ app.post('/api/whatsapp/enviar', async (req, res) => {
 });
 
 app.get('/api/whatsapp/contactos/:numero', async (req, res) => {
-  const { numero } = req.params;
+  const numero = normalizePhone(req.params.numero);
 
   try {
     const { data: account } = await supabase
@@ -570,11 +691,54 @@ app.get('/api/whatsapp/contactos/:numero', async (req, res) => {
   }
 });
 
+// SSE Endpoint - Auth via query param (EventSource no soporta headers custom)
+app.get('/api/whatsapp/events', (req, res) => {
+  const apiKey = req.query.apiKey;
+  if (!apiKey || apiKey !== API_KEY) {
+    return res.status(401).json({ error: 'API key inválida o faltante' });
+  }
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+  });
+
+  res.write('event: connected\ndata: {}\n\n');
+  sseClients.add(res);
+
+  const heartbeat = setInterval(() => {
+    res.write(': heartbeat\n\n');
+  }, 30000);
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    sseClients.delete(res);
+  });
+});
+
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`🚀 Servidor Baileys corriendo en puerto ${PORT}`);
   console.log(`📊 Health check: http://localhost:${PORT}/health`);
+
+  // Auto-reconectar sesiones que estaban conectadas antes del reinicio
+  try {
+    const { data: activeAccounts } = await supabase
+      .from('whatsapp_accounts')
+      .select('display_phone_number')
+      .eq('connection_status', 'open');
+
+    for (const acc of activeAccounts || []) {
+      console.log(`🔄 Reconectando ${acc.display_phone_number}...`);
+      startWhatsAppSession(acc.display_phone_number).catch(err =>
+        console.error(`Error reconectando ${acc.display_phone_number}:`, err)
+      );
+    }
+  } catch (err) {
+    console.error('Error en auto-reconexión:', err);
+  }
 });
