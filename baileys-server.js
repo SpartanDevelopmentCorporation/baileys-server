@@ -50,6 +50,7 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use((req, res, next) => {
   if (req.path === '/health') return next();
   if (req.path === '/api/whatsapp/events') return next();
+  if (req.path === '/api/whatsapp/debug') return next();
 
   const apiKey = req.headers['x-api-key'];
   if (!apiKey || apiKey !== API_KEY) {
@@ -562,6 +563,7 @@ app.get('/api/whatsapp/qr/:numero', async (req, res) => {
 
 // Debug endpoint - ver estado de sesiones activas
 app.get('/api/whatsapp/debug', (req, res) => {
+  if (req.query.key !== API_KEY) return res.status(401).json({ error: 'Add ?key=YOUR_API_KEY' });
   const sessions = {};
   for (const [num, session] of Object.entries(activeSessions)) {
     sessions[num] = {
