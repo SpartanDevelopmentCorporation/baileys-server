@@ -199,7 +199,7 @@ async function startWhatsAppSession(numero) {
     const { makeWASocket, DisconnectReason } =
       await initBaileys();
 
-    console.log(`Iniciando sesión para ${numero}...`);
+    debugLog(`Iniciando sesión para ${numero}...`);
 
     const { state, saveCreds } = await useSupabaseAuthState(numero);
 
@@ -238,6 +238,7 @@ async function startWhatsAppSession(numero) {
 
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
+      debugLog(`[${numero}] connection.update: ${JSON.stringify({ connection, qr: qr ? 'QR_PRESENT' : null, hasLastDisconnect: !!lastDisconnect })}`);
 
       if (qr) {
         try {
@@ -246,7 +247,7 @@ async function startWhatsAppSession(numero) {
             activeSessions[numero].qr = currentQRCode;
             activeSessions[numero].estado = 'qr_esperando';
           }
-          console.log(`[${numero}] QR generado`);
+          debugLog(`[${numero}] QR generado`);
 
           await supabase
             .from('whatsapp_accounts')
@@ -559,6 +560,29 @@ app.get('/api/whatsapp/qr/:numero', async (req, res) => {
   }
 });
 
+// Debug endpoint - ver estado de sesiones activas
+app.get('/api/whatsapp/debug', (req, res) => {
+  const sessions = {};
+  for (const [num, session] of Object.entries(activeSessions)) {
+    sessions[num] = {
+      estado: session.estado,
+      hasQr: !!session.qr,
+      hasQrResolve: !!session.qrResolve,
+      lastError: session.lastError,
+    };
+  }
+  res.json({ sessions, debugLogs: debugBuffer });
+});
+
+// Buffer circular para debug logs
+const debugBuffer = [];
+function debugLog(msg) {
+  const entry = `[${new Date().toISOString()}] ${msg}`;
+  console.log(entry);
+  debugBuffer.push(entry);
+  if (debugBuffer.length > 50) debugBuffer.shift();
+}
+
 app.post('/api/whatsapp/connect/:numero', async (req, res) => {
   const numero = normalizePhone(req.params.numero);
 
@@ -593,9 +617,9 @@ app.post('/api/whatsapp/connect/:numero', async (req, res) => {
 
     const { sock, qrPromise } = await startWhatsAppSession(numero);
 
-    // Esperar QR con timeout de 30 segundos
+    // Esperar QR con timeout de 60 segundos
     const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('timeout')), 30000)
+      setTimeout(() => reject(new Error('timeout')), 60000)
     );
 
     try {
