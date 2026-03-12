@@ -206,17 +206,29 @@ async function startWhatsAppSession(numero) {
       logger: baileysLogger,
     });
 
+    // Inicializar ANTES de registrar event handlers para evitar race condition
+    activeSessions[numero] = {
+      socket: sock,
+      estado: 'inicializando',
+      qr: null,
+      qrResolve: null,
+    };
+
+    // Promise que se resuelve cuando llega el primer QR o se conecta directo
+    const qrPromise = new Promise((resolve) => {
+      activeSessions[numero].qrResolve = resolve;
+    });
+
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
         try {
           currentQRCode = await QRCode.toDataURL(qr);
-          activeSessions[numero] = {
-            ...activeSessions[numero],
-            qr: currentQRCode,
-            estado: 'qr_esperando'
-          };
+          if (activeSessions[numero]) {
+            activeSessions[numero].qr = currentQRCode;
+            activeSessions[numero].estado = 'qr_esperando';
+          }
           console.log(`[${numero}] QR generado`);
 
           await supabase
@@ -228,7 +240,13 @@ async function startWhatsAppSession(numero) {
             })
             .eq('display_phone_number', numero);
 
-          broadcast('qr_update', { account: numero });
+          broadcast('qr_update', { account: numero, qr: currentQRCode });
+
+          // Resolver el promise para que /connect retorne el QR
+          if (activeSessions[numero]?.qrResolve) {
+            activeSessions[numero].qrResolve(currentQRCode);
+            activeSessions[numero].qrResolve = null;
+          }
         } catch (err) {
           console.error('Error generando QR:', err);
         }
@@ -236,11 +254,11 @@ async function startWhatsAppSession(numero) {
 
       if (connection === 'open') {
         console.log(`✅ [${numero}] Conectado a WhatsApp`);
-        activeSessions[numero] = {
-          ...activeSessions[numero],
-          estado: 'conectado',
-          socket: sock
-        };
+        if (activeSessions[numero]) {
+          activeSessions[numero].estado = 'conectado';
+          activeSessions[numero].socket = sock;
+          activeSessions[numero].qr = null;
+        }
 
         await supabase
           .from('whatsapp_accounts')
@@ -252,15 +270,31 @@ async function startWhatsAppSession(numero) {
           .eq('display_phone_number', numero);
 
         broadcast('connection_update', { account: numero, status: 'connected' });
+
+        // Resolver promise si /connect está esperando (reconexión sin QR)
+        if (activeSessions[numero]?.qrResolve) {
+          activeSessions[numero].qrResolve(null);
+          activeSessions[numero].qrResolve = null;
+        }
+
         await syncContactos(numero, sock);
       }
 
       if (connection === 'close') {
-        const shouldReconnect = 
+        const shouldReconnect =
           lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
 
-        console.log(`❌ [${numero}] Desconectado`);
-        activeSessions[numero].estado = 'desconectado';
+        console.log(`❌ [${numero}] Desconectado, reconnect: ${shouldReconnect}`);
+
+        if (activeSessions[numero]) {
+          activeSessions[numero].estado = 'desconectado';
+        }
+
+        // Resolver promise para desbloquear /connect si está esperando
+        if (activeSessions[numero]?.qrResolve) {
+          activeSessions[numero].qrResolve(null);
+          activeSessions[numero].qrResolve = null;
+        }
 
         if (shouldReconnect) {
           setTimeout(() => startWhatsAppSession(numero), 3000);
@@ -269,7 +303,7 @@ async function startWhatsAppSession(numero) {
         await supabase
           .from('whatsapp_accounts')
           .update({
-            connection_status: 'close'
+            connection_status: shouldReconnect ? 'reconnecting' : 'disconnected'
           })
           .eq('display_phone_number', numero);
 
@@ -287,12 +321,7 @@ async function startWhatsAppSession(numero) {
 
     sock.ev.on('creds.update', saveCreds);
 
-    activeSessions[numero] = {
-      socket: sock,
-      estado: 'inicializando'
-    };
-
-    return sock;
+    return { sock, qrPromise };
   } catch (error) {
     console.error(`Error iniciando sesión ${numero}:`, error);
     throw error;
@@ -514,23 +543,56 @@ app.post('/api/whatsapp/connect/:numero', async (req, res) => {
   const numero = normalizePhone(req.params.numero);
 
   try {
-    const { data } = await supabase
+    // Verificar si existe en Supabase, si no, auto-crear
+    const { data: existing } = await supabase
       .from('whatsapp_accounts')
       .select('id')
       .eq('display_phone_number', numero)
       .single();
 
-    if (!data) {
-      return res.status(404).json({ error: 'WhatsApp Account no existe' });
+    if (!existing) {
+      console.log(`[${numero}] Auto-creando registro en whatsapp_accounts`);
+      await supabase.from('whatsapp_accounts').insert({
+        name: numero,
+        display_phone_number: numero,
+        connection_status: 'connecting',
+      });
+    } else {
+      await supabase.from('whatsapp_accounts')
+        .update({ connection_status: 'connecting' })
+        .eq('display_phone_number', numero);
     }
 
-    await startWhatsAppSession(numero);
+    const { sock, qrPromise } = await startWhatsAppSession(numero);
 
-    res.json({
-      success: true,
-      mensaje: `Iniciando conexión para ${numero}. Escanea el QR.`
-    });
+    // Esperar QR con timeout de 30 segundos
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('timeout')), 30000)
+    );
+
+    try {
+      const qr = await Promise.race([qrPromise, timeoutPromise]);
+      if (qr) {
+        res.json({ success: true, qr, estado: 'qr_esperando' });
+      } else if (activeSessions[numero]?.estado === 'conectado') {
+        res.json({ success: true, qr: null, estado: 'conectado' });
+      } else {
+        res.json({ success: true, qr: null, estado: activeSessions[numero]?.estado || 'inicializando' });
+      }
+    } catch (e) {
+      // Timeout
+      if (activeSessions[numero]?.estado === 'conectado') {
+        res.json({ success: true, qr: null, estado: 'conectado' });
+      } else {
+        res.status(504).json({
+          success: false,
+          error: 'Timeout esperando QR de WhatsApp (30s)',
+          estado: activeSessions[numero]?.estado
+        });
+      }
+    }
   } catch (error) {
+    console.error(`Error en /connect/${numero}:`, error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -757,9 +819,9 @@ app.listen(PORT, async () => {
 
     for (const acc of activeAccounts || []) {
       console.log(`🔄 Reconectando ${acc.display_phone_number}...`);
-      startWhatsAppSession(acc.display_phone_number).catch(err =>
-        console.error(`Error reconectando ${acc.display_phone_number}:`, err)
-      );
+      startWhatsAppSession(acc.display_phone_number)
+        .then(({ sock }) => console.log(`✅ Reconexión iniciada para ${acc.display_phone_number}`))
+        .catch(err => console.error(`Error reconectando ${acc.display_phone_number}:`, err));
     }
   } catch (err) {
     console.error('Error en auto-reconexión:', err);
