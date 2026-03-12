@@ -75,7 +75,10 @@ function broadcast(event, data) {
 }
 
 async function useSupabaseAuthState(sessionId) {
-  const { initAuthCreds, BufferJSON, proto } = await import('@whiskeysockets/baileys');
+  const baileys = await import('@whiskeysockets/baileys');
+  const initAuthCreds = baileys.initAuthCreds;
+  const BufferJSON = baileys.BufferJSON;
+  const proto = baileys.proto;
 
   // Read creds from Supabase
   const { data: credsRow } = await supabase
@@ -157,8 +160,9 @@ async function useSupabaseAuthState(sessionId) {
 
 async function initBaileys() {
   try {
-    const { default: makeWASocket, DisconnectReason } =
-      await import('@whiskeysockets/baileys');
+    const baileys = await import('@whiskeysockets/baileys');
+    const makeWASocket = baileys.default || baileys.makeWASocket;
+    const { DisconnectReason } = baileys;
 
     console.log('Baileys importado correctamente');
     return { makeWASocket, DisconnectReason };
@@ -167,6 +171,18 @@ async function initBaileys() {
     throw error;
   }
 }
+
+// Logger compatible con Baileys (requiere interfaz pino-like)
+const baileysLogger = {
+  level: 'silent',
+  trace: () => {},
+  debug: () => {},
+  info: () => {},
+  warn: console.warn,
+  error: console.error,
+  fatal: console.error,
+  child: () => baileysLogger,
+};
 
 async function startWhatsAppSession(numero) {
   try {
@@ -180,7 +196,7 @@ async function startWhatsAppSession(numero) {
     const sock = makeWASocket({
       auth: state,
       printQRInTerminal: false,
-      logger: { info: console.log, error: console.error, warn: console.warn }
+      logger: baileysLogger,
     });
 
     sock.ev.on('connection.update', async (update) => {
