@@ -206,17 +206,29 @@ async function startWhatsAppSession(numero) {
       logger: baileysLogger,
     });
 
+    // Preservar qrResolve si existe (reconexión mientras /connect espera)
+    const existingResolve = activeSessions[numero]?.qrResolve || null;
+
     // Inicializar ANTES de registrar event handlers para evitar race condition
     activeSessions[numero] = {
       socket: sock,
       estado: 'inicializando',
       qr: null,
-      qrResolve: null,
+      qrResolve: existingResolve,
     };
 
     // Promise que se resuelve cuando llega el primer QR o se conecta directo
     const qrPromise = new Promise((resolve) => {
-      activeSessions[numero].qrResolve = resolve;
+      if (!activeSessions[numero].qrResolve) {
+        activeSessions[numero].qrResolve = resolve;
+      } else {
+        // Ya hay un resolver pendiente (reconexión), encadenar ambos
+        const original = activeSessions[numero].qrResolve;
+        activeSessions[numero].qrResolve = (value) => {
+          original(value);
+          resolve(value);
+        };
+      }
     });
 
     sock.ev.on('connection.update', async (update) => {
@@ -281,17 +293,18 @@ async function startWhatsAppSession(numero) {
       }
 
       if (connection === 'close') {
-        const shouldReconnect =
-          lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-        console.log(`❌ [${numero}] Desconectado, reconnect: ${shouldReconnect}`);
+        console.log(`❌ [${numero}] Desconectado, statusCode: ${statusCode}, reconnect: ${shouldReconnect}`);
 
         if (activeSessions[numero]) {
-          activeSessions[numero].estado = 'desconectado';
+          activeSessions[numero].estado = shouldReconnect ? 'reconectando' : 'desconectado';
         }
 
-        // Resolver promise para desbloquear /connect si está esperando
-        if (activeSessions[numero]?.qrResolve) {
+        // Solo resolver qrPromise si NO va a reconectar
+        // Si va a reconectar, dejamos el promise pendiente para que la reconexión genere el QR
+        if (!shouldReconnect && activeSessions[numero]?.qrResolve) {
           activeSessions[numero].qrResolve(null);
           activeSessions[numero].qrResolve = null;
         }
@@ -562,6 +575,14 @@ app.post('/api/whatsapp/connect/:numero', async (req, res) => {
         .update({ connection_status: 'connecting' })
         .eq('display_phone_number', numero);
     }
+
+    // Limpiar creds anteriores corruptas para forzar QR fresco
+    // (si ya estuviera conectado, no llegaría aquí porque el frontend no muestra el botón)
+    console.log(`[${numero}] Limpiando auth state previo para forzar QR nuevo`);
+    await supabase
+      .from('baileys_auth_state')
+      .delete()
+      .eq('session_id', numero);
 
     const { sock, qrPromise } = await startWhatsAppSession(numero);
 
