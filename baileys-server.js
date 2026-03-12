@@ -161,10 +161,17 @@ async function useSupabaseAuthState(sessionId) {
 async function initBaileys() {
   try {
     const baileys = await import('@whiskeysockets/baileys');
-    const makeWASocket = baileys.default || baileys.makeWASocket;
-    const { DisconnectReason } = baileys;
+    // Baileys puede exportar la función como default, default.default, o makeWASocket
+    let makeWASocket = baileys.default;
+    if (makeWASocket && typeof makeWASocket !== 'function' && makeWASocket.default) {
+      makeWASocket = makeWASocket.default;
+    }
+    if (typeof makeWASocket !== 'function') {
+      makeWASocket = baileys.makeWASocket;
+    }
+    const DisconnectReason = baileys.DisconnectReason;
 
-    console.log('Baileys importado correctamente');
+    console.log('Baileys importado correctamente, makeWASocket type:', typeof makeWASocket);
     return { makeWASocket, DisconnectReason };
   } catch (error) {
     console.error('Error importando Baileys:', error);
