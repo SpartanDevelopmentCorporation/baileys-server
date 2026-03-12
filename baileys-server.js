@@ -181,13 +181,13 @@ async function initBaileys() {
 
 // Logger compatible con Baileys (requiere interfaz pino-like)
 const baileysLogger = {
-  level: 'silent',
+  level: 'warn',
   trace: () => {},
   debug: () => {},
   info: () => {},
-  warn: console.warn,
-  error: console.error,
-  fatal: console.error,
+  warn: (...args) => console.warn('[Baileys]', ...args),
+  error: (...args) => console.error('[Baileys]', ...args),
+  fatal: (...args) => console.error('[Baileys FATAL]', ...args),
   child: () => baileysLogger,
 };
 
@@ -204,6 +204,7 @@ async function startWhatsAppSession(numero) {
       auth: state,
       printQRInTerminal: false,
       logger: baileysLogger,
+      browser: ['Nexus', 'Chrome', '120.0.0'],
     });
 
     // Preservar qrResolve si existe (reconexión mientras /connect espera)
@@ -215,6 +216,7 @@ async function startWhatsAppSession(numero) {
       estado: 'inicializando',
       qr: null,
       qrResolve: existingResolve,
+      lastError: null,
     };
 
     // Promise que se resuelve cuando llega el primer QR o se conecta directo
@@ -296,10 +298,12 @@ async function startWhatsAppSession(numero) {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-        console.log(`❌ [${numero}] Desconectado, statusCode: ${statusCode}, reconnect: ${shouldReconnect}`);
+        const errorMsg = lastDisconnect?.error?.message || 'unknown';
+        console.log(`❌ [${numero}] Desconectado, statusCode: ${statusCode}, error: ${errorMsg}, reconnect: ${shouldReconnect}`);
 
         if (activeSessions[numero]) {
           activeSessions[numero].estado = shouldReconnect ? 'reconectando' : 'desconectado';
+          activeSessions[numero].lastError = `statusCode=${statusCode}, error=${errorMsg}`;
         }
 
         // Solo resolver qrPromise si NO va a reconectar
@@ -608,7 +612,8 @@ app.post('/api/whatsapp/connect/:numero', async (req, res) => {
         res.status(504).json({
           success: false,
           error: 'Timeout esperando QR de WhatsApp (30s)',
-          estado: activeSessions[numero]?.estado
+          estado: activeSessions[numero]?.estado,
+          lastError: activeSessions[numero]?.lastError,
         });
       }
     }
