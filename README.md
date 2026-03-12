@@ -3,6 +3,7 @@
 Servidor Node.js que conecta WhatsApp (vía Baileys) con Supabase para sincronizar mensajes, contactos y conversaciones.
 
 ---
+Grcias.
 
 ## 📋 REQUISITOS
 
