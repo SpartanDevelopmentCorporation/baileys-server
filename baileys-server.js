@@ -5,6 +5,14 @@ import express from 'express';
 import QRCode from 'qrcode';
 import { createClient } from '@supabase/supabase-js';
 
+// Prevenir crashes por errores no manejados de sockets/fetch
+process.on('uncaughtException', (err) => {
+  console.error('⚠️ Uncaught Exception (no crash):', err.message);
+});
+process.on('unhandledRejection', (err) => {
+  console.error('⚠️ Unhandled Rejection (no crash):', err.message || err);
+});
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -174,9 +182,19 @@ async function initBaileys() {
       makeWASocket = baileys.makeWASocket;
     }
     const DisconnectReason = baileys.DisconnectReason;
+    const fetchLatestWaWebVersion = baileys.fetchLatestWaWebVersion;
+
+    let version;
+    try {
+      const result = await fetchLatestWaWebVersion({});
+      version = result.version;
+      console.log('Versión WA Web obtenida:', version);
+    } catch (err) {
+      console.warn('No se pudo obtener versión WA Web, usando default:', err.message);
+    }
 
     console.log('Baileys importado correctamente, makeWASocket type:', typeof makeWASocket);
-    return { makeWASocket, DisconnectReason };
+    return { makeWASocket, DisconnectReason, version };
   } catch (error) {
     console.error('Error importando Baileys:', error);
     throw error;
@@ -197,19 +215,22 @@ const baileysLogger = {
 
 async function startWhatsAppSession(numero) {
   try {
-    const { makeWASocket, DisconnectReason } =
+    const { makeWASocket, DisconnectReason, version } =
       await initBaileys();
 
     debugLog(`Iniciando sesión para ${numero}...`);
 
     const { state, saveCreds } = await useSupabaseAuthState(numero);
 
-    const sock = makeWASocket({
+    const socketOpts = {
       auth: state,
       printQRInTerminal: false,
       logger: baileysLogger,
       browser: ['Nexus', 'Chrome', '120.0.0'],
-    });
+    };
+    if (version) socketOpts.version = version;
+
+    const sock = makeWASocket(socketOpts);
 
     // Preservar qrResolve si existe (reconexión mientras /connect espera)
     const existingResolve = activeSessions[numero]?.qrResolve || null;
@@ -352,8 +373,6 @@ async function startWhatsAppSession(numero) {
 
 async function syncContactos(numero, sock) {
   try {
-    const contacts = await sock.fetchContacts();
-
     const { data: account } = await supabase
       .from('whatsapp_accounts')
       .select('id')
@@ -367,35 +386,45 @@ async function syncContactos(numero, sock) {
 
     const whatsapp_account_id = account.id;
 
-    for (const contact of contacts) {
-      const phoneNumber = contact.id.split('@')[0];
-      if (phoneNumber === 'status') continue;
+    // En Baileys v7, los contactos llegan por el evento 'contacts.upsert'
+    sock.ev.on('contacts.upsert', async (contacts) => {
+      let count = 0;
+      for (const contact of contacts) {
+        const phoneNumber = contact.id.split('@')[0];
+        if (phoneNumber === 'status') continue;
 
-      const fullPhone = phoneNumber.includes(':') 
-        ? '+' + phoneNumber.split(':')[0] 
-        : '+' + phoneNumber;
+        const fullPhone = phoneNumber.includes(':')
+          ? '+' + phoneNumber.split(':')[0]
+          : '+' + phoneNumber;
 
-      const { error } = await supabase
-        .from('contacts')
-        .upsert({
-          full_name: contact.name || fullPhone,
-          phone: fullPhone,
-          phone_e164: fullPhone,
-          whatsapp_account_id: whatsapp_account_id,
-          target_phone_number: numero,
-          avatar_url: contact.picture || null
-        }, {
-          onConflict: 'phone,whatsapp_account_id'
-        });
+        const { error } = await supabase
+          .from('contacts')
+          .upsert({
+            full_name: contact.name || contact.notify || fullPhone,
+            phone: fullPhone,
+            phone_e164: fullPhone,
+            whatsapp_account_id: whatsapp_account_id,
+            target_phone_number: numero,
+            avatar_url: null
+          }, {
+            onConflict: 'phone,whatsapp_account_id'
+          });
 
-      if (error) {
-        console.error(`Error guardando contacto ${fullPhone}:`, error);
+        if (error) {
+          console.error(`Error guardando contacto ${fullPhone}:`, error);
+        } else {
+          count++;
+        }
       }
-    }
 
-    console.log(`✅ Sincronizados ${contacts.length} contactos para ${numero}`);
+      if (count > 0) {
+        console.log(`✅ Sincronizados ${count} contactos para ${numero}`);
+      }
+    });
+
+    console.log(`📇 Listener de contactos registrado para ${numero}`);
   } catch (error) {
-    console.error(`Error sincronizando contactos:`, error);
+    console.error(`Error configurando sync de contactos:`, error);
   }
 }
 
@@ -609,8 +638,14 @@ app.post('/api/whatsapp/connect/:numero', async (req, res) => {
         .eq('display_phone_number', numero);
     }
 
+    // Cerrar sesión anterior si existe
+    if (activeSessions[numero]?.socket) {
+      console.log(`[${numero}] Cerrando sesión anterior...`);
+      try { activeSessions[numero].socket.end(); } catch (e) {}
+      delete activeSessions[numero];
+    }
+
     // Limpiar creds anteriores corruptas para forzar QR fresco
-    // (si ya estuviera conectado, no llegaría aquí porque el frontend no muestra el botón)
     console.log(`[${numero}] Limpiando auth state previo para forzar QR nuevo`);
     await supabase
       .from('baileys_auth_state')
