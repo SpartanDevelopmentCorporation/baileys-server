@@ -109,6 +109,120 @@ Tu servidor estará en: `https://tu-proyecto.railway.app`
 
 ---
 
+## 🐳 DOCKER
+
+### Build
+
+```bash
+docker build -t baileys-server .
+```
+
+### Run
+
+```bash
+docker run -d \
+  --name baileys-server \
+  --restart unless-stopped \
+  -p 3000:3000 \
+  --env-file .env \
+  --memory 512m \
+  --log-opt max-size=10m \
+  --log-opt max-file=3 \
+  baileys-server
+```
+
+### Required env vars (in `.env`)
+
+| Variable | Description |
+|---|---|
+| `SUPABASE_URL` | Your Supabase project URL |
+| `SUPABASE_KEY` | Supabase API key (anon or service role) |
+| `API_KEY` | Secret key to authenticate API calls (`x-api-key` header) |
+| `WEBHOOK_SECRET` | (Optional) Second secret for server-to-server calls (`x-webhook-secret` header) |
+| `PORT` | (Optional) Port inside container, default `3000` |
+| `ALLOWED_ORIGINS` | (Optional) Comma-separated allowed origins, default `*` |
+
+### Same-network deployment (remote host)
+
+On the remote host:
+
+```bash
+# SSH into the machine
+ssh user@your-remote-host
+
+# Install Docker if needed
+curl -fsSL https://get.docker.com | sh
+
+# Create a working directory
+mkdir -p ~/baileys && cd ~/baileys
+
+# Copy your .env file there
+scp .env user@your-remote-host:~/baileys/
+
+# Build and run
+docker build -t baileys-server .
+docker run -d \
+  --name baileys-server \
+  --restart unless-stopped \
+  -p 3000:3000 \
+  --env-file .env \
+  --memory 512m \
+  baileys-server
+```
+
+Your app (Vercel / Base44 / etc.) calls this server at `http://<remote-ip>:3000` from the same network, or via your public IP + port-forward. Set `ALLOWED_ORIGINS` to restrict which origins can call the API.
+
+---
+
+## 🔒 SEGURIDAD
+
+### Claves de autenticación
+
+El servidor acepta **dos claves secretas** en paralelo. Puedes usar una o ambas:
+
+| Clave | Env var | Header | Uso |
+|---|---|---|---|
+| `API_KEY` | `API_KEY` | `x-api-key` | Llamadas directas desde Edge Functions o clientes |
+| `WEBHOOK_SECRET` | `WEBHOOK_SECRET` | `x-webhook-secret` | Server-to-server (Edge Functions como intermediarias) |
+
+### Arquitectura recomendada (frontend → Baileys nunca directo)
+
+```
+Navegador / App
+      ↓
+Supabase (lecturas + Realtime)
+      ↓  fetch() con x-api-key o x-webhook-secret
+Baileys Docker (servidor propio)
+```
+
+**Nunca expongas las claves API en el navegador.** Todas las llamadas al Baileys server deben pasar por Supabase Edge Functions o tu backend.
+
+### Endpoints públicos (sin clave)
+
+| Ruta | Notas |
+|---|---|
+| `GET /health` | Solo verificación de vida del servicio |
+
+### Endpoints protegidos (requieren clave)
+
+Todas las demás rutas requieren `x-api-key` **o** `x-webhook-secret` en el header.
+
+### Ejemplo desde Supabase Edge Function
+
+```javascript
+// Enviar mensaje via Baileys
+await fetch('http://tu-baileys-host:3000/api/whatsapp/enviar', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'x-api-key': Deno.env.get('API_KEY'),
+  },
+  body: JSON.stringify({ numero: '+34123456789', contacto: '+34987654321', mensaje: 'Hola' })
+});
+```
+
+---
+
 ## 📡 API ENDPOINTS
 
 ### Conectar un número

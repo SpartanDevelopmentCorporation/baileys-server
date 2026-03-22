@@ -19,6 +19,7 @@ const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const API_KEY = process.env.API_KEY;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS || '*';
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
@@ -42,7 +43,7 @@ app.use((req, res, next) => {
     }
   }
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, x-api-key');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, x-api-key, x-webhook-secret');
 
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
@@ -55,13 +56,19 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // Auth Middleware - Validar API Key en todas las rutas excepto /health y /api/whatsapp/events (SSE usa query param)
+// Acepta x-api-key (para llamadas directas) o x-webhook-secret (para server-to-server via Edge Functions)
 app.use((req, res, next) => {
   if (req.path === '/health') return next();
   if (req.path === '/api/whatsapp/events') return next();
   if (req.path === '/api/whatsapp/debug') return next();
 
   const apiKey = req.headers['x-api-key'];
-  if (!apiKey || apiKey !== API_KEY) {
+  const webhookSecret = req.headers['x-webhook-secret'];
+
+  const validApiKey = apiKey === API_KEY;
+  const validWebhookSecret = WEBHOOK_SECRET && webhookSecret === WEBHOOK_SECRET;
+
+  if (!validApiKey && !validWebhookSecret) {
     return res.status(401).json({ error: 'API key inválida o faltante' });
   }
   next();
@@ -592,7 +599,9 @@ app.get('/api/whatsapp/qr/:numero', async (req, res) => {
 
 // Debug endpoint - ver estado de sesiones activas
 app.get('/api/whatsapp/debug', (req, res) => {
-  if (req.query.key !== API_KEY) return res.status(401).json({ error: 'Add ?key=YOUR_API_KEY' });
+  const validKey = req.query.key === API_KEY;
+  const validSecret = WEBHOOK_SECRET && req.headers['x-webhook-secret'] === WEBHOOK_SECRET;
+  if (!validKey && !validSecret) return res.status(401).json({ error: 'Add ?key=YOUR_API_KEY or x-webhook-secret header' });
   const sessions = {};
   for (const [num, session] of Object.entries(activeSessions)) {
     sessions[num] = {
@@ -867,9 +876,15 @@ app.get('/api/whatsapp/contactos/:numero', async (req, res) => {
 });
 
 // SSE Endpoint - Auth via query param (EventSource no soporta headers custom)
+// Acepta apiKey query param (para clientes legacy) o x-webhook-secret header (para server-to-server)
 app.get('/api/whatsapp/events', (req, res) => {
   const apiKey = req.query.apiKey;
-  if (!apiKey || apiKey !== API_KEY) {
+  const webhookSecret = req.headers['x-webhook-secret'];
+
+  const validApiKey = apiKey === API_KEY;
+  const validWebhookSecret = WEBHOOK_SECRET && webhookSecret === WEBHOOK_SECRET;
+
+  if (!validApiKey && !validWebhookSecret) {
     return res.status(401).json({ error: 'API key inválida o faltante' });
   }
 
