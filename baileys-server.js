@@ -794,6 +794,8 @@ async function handleAIResponse(numero, contactId, accountId, content) {
           'destino_pais': 'destination_country',
           'destino_ciudad': 'destination_city',
           'zip': 'zip_code',
+          'usa_zip': 'usa_zip_code',
+          'mx_zip': 'mx_zip_code',
           'origen_estado': 'origin_state',
           'origen_ciudad': 'origin_city',
           'servicio': 'service_type',
