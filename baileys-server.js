@@ -433,10 +433,10 @@ async function syncContactos(numero, sock) {
         if (phoneNumber === 'status') continue;
 
         // Build LID → phone map
-        if (contact.lid) {
-          const lid = contact.lid.split('@')[0];
-          lidToPhone[lid] = phoneNumber.includes(':') ? phoneNumber.split(':')[0] : phoneNumber;
-          debugLog(`[${numero}] LID map from contact: ${lid} → ${lidToPhone[lid]}`);
+        const contactLid = contact.lid ? contact.lid.split('@')[0] : null;
+        if (contactLid) {
+          const realPhone = phoneNumber.includes(':') ? phoneNumber.split(':')[0] : phoneNumber;
+          lidToPhone[contactLid] = realPhone;
         }
 
         const cleanPhone = phoneNumber.includes(':')
@@ -454,11 +454,14 @@ async function syncContactos(numero, sock) {
           .single();
 
         if (existing) {
-          // Update name if we have a better one
-          if (contact.name || contact.notify) {
+          // Update name and LID if we have them
+          const updateData = {};
+          if (contact.name || contact.notify) updateData.name = contactName;
+          if (contactLid) updateData.lid = contactLid;
+          if (Object.keys(updateData).length > 0) {
             await supabase
               .from('wmp_contacts')
-              .update({ name: contactName })
+              .update(updateData)
               .eq('id', existing.id);
           }
         } else {
@@ -498,22 +501,32 @@ async function guardarMensaje(numero, message) {
     const remoteJid = message.key.remoteJid;
     const isLid = remoteJid.endsWith('@lid');
 
-    // For LID messages, try to resolve to real phone number
     let cleanPhone;
+    let contact = null;
+
     if (isLid) {
       const lidNum = remoteJid.split('@')[0];
-      // Check our LID → phone map first
-      if (lidToPhone[lidNum]) {
+
+      // First: try to find contact by LID column in DB
+      const { data: lidContact } = await supabase
+        .from('wmp_contacts')
+        .select('id, phone_number')
+        .eq('lid', lidNum)
+        .eq('whatsapp_account_id', account.id)
+        .single();
+
+      if (lidContact) {
+        contact = lidContact;
+        cleanPhone = lidContact.phone_number;
+        debugLog(`[${numero}] Resolved LID ${lidNum} → ${cleanPhone} via DB`);
+      } else if (lidToPhone[lidNum]) {
+        // Second: try in-memory map
         cleanPhone = lidToPhone[lidNum];
         debugLog(`[${numero}] Resolved LID ${lidNum} → ${cleanPhone} via map`);
       } else {
-        // Try participant field
-        const participant = message.key.participant;
-        if (participant && participant.endsWith('@s.whatsapp.net')) {
-          cleanPhone = participant.split('@')[0];
-        } else {
-          cleanPhone = lidNum;
-        }
+        // Fallback: store with LID as phone
+        cleanPhone = lidNum;
+        debugLog(`[${numero}] Could not resolve LID ${lidNum}, storing as-is`);
       }
     } else {
       const contactNumber = remoteJid.split('@')[0];
@@ -522,15 +535,17 @@ async function guardarMensaje(numero, message) {
         : contactNumber;
     }
 
-    debugLog(`[${numero}] Resolved phone: ${cleanPhone} (isLid: ${isLid}, jid: ${remoteJid})`);
+    // Find contact by phone if not already found via LID
+    if (!contact) {
+      const { data: phoneContact } = await supabase
+        .from('wmp_contacts')
+        .select('id')
+        .eq('phone_number', cleanPhone)
+        .eq('whatsapp_account_id', account.id)
+        .single();
 
-    // Find or create contact
-    let { data: contact } = await supabase
-      .from('wmp_contacts')
-      .select('id')
-      .eq('phone_number', cleanPhone)
-      .eq('whatsapp_account_id', account.id)
-      .single();
+      contact = phoneContact;
+    }
 
     if (!contact) {
       const { data: newContact } = await supabase
