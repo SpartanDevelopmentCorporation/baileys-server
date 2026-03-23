@@ -360,10 +360,21 @@ async function startWhatsAppSession(numero) {
     });
 
     sock.ev.on('messages.upsert', async (m) => {
-      const message = m.messages[0];
+      debugLog(`[${numero}] messages.upsert: ${m.messages.length} mensajes, type: ${m.type}`);
+      for (const message of m.messages) {
+        const fromMe = message.key.fromMe;
+        const hasMsg = !!message.message;
+        const remoteJid = message.key.remoteJid;
+        debugLog(`[${numero}] msg: fromMe=${fromMe}, hasMessage=${hasMsg}, jid=${remoteJid}`);
 
-      if (!message.key.fromMe && message.message) {
-        await guardarMensaje(numero, message);
+        if (!fromMe && hasMsg) {
+          try {
+            await guardarMensaje(numero, message);
+            debugLog(`[${numero}] ✅ Mensaje guardado de ${remoteJid}`);
+          } catch (err) {
+            debugLog(`[${numero}] ❌ Error guardando mensaje: ${err.message}`);
+          }
+        }
       }
     });
 
