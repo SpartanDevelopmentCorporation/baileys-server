@@ -534,7 +534,7 @@ async function guardarMensaje(numero, message) {
         whatsapp_account_id: account.id,
         content: content,
         direction: 'inbound',
-        sender_type: 'contact',
+        sender_type: 'customer',
       });
 
     if (msgError) {
