@@ -589,18 +589,18 @@ async function guardarMensaje(numero, message) {
       return;
     }
 
-    // Update contact: last_message_at and unread_count
-    const { data: unreadData } = await supabase
-      .from('wmp_messages')
-      .select('id', { count: 'exact', head: true })
-      .eq('contact_id', contact.id)
-      .eq('direction', 'inbound');
+    // Get current unread count and increment
+    const { data: currentContact } = await supabase
+      .from('wmp_contacts')
+      .select('unread_count')
+      .eq('id', contact.id)
+      .single();
 
     await supabase
       .from('wmp_contacts')
       .update({
         last_message_at: new Date().toISOString(),
-        unread_count: (unreadData?.length || 0),
+        unread_count: ((currentContact?.unread_count || 0) + 1),
       })
       .eq('id', contact.id);
 
