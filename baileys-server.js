@@ -83,6 +83,9 @@ let sock = null;
 let currentQRCode = null;
 let activeSessions = {};
 
+// Map LID → real phone number
+const lidToPhone = {};
+
 // SSE - Server-Sent Events para actualizaciones en tiempo real
 const sseClients = new Set();
 
@@ -409,12 +412,32 @@ async function syncContactos(numero, sock) {
 
     const whatsapp_account_id = account.id;
 
+    // Build LID → phone map from contacts.update events
+    sock.ev.on('contacts.update', async (updates) => {
+      for (const update of updates) {
+        // contacts.update may contain lid ↔ phone mappings
+        if (update.id && update.lid) {
+          const phone = update.id.split('@')[0];
+          const lid = update.lid.split('@')[0];
+          lidToPhone[lid] = phone;
+          debugLog(`[${numero}] LID map: ${lid} → ${phone}`);
+        }
+      }
+    });
+
     // En Baileys v7, los contactos llegan por el evento 'contacts.upsert'
     sock.ev.on('contacts.upsert', async (contacts) => {
       let count = 0;
       for (const contact of contacts) {
         const phoneNumber = contact.id.split('@')[0];
         if (phoneNumber === 'status') continue;
+
+        // Build LID → phone map
+        if (contact.lid) {
+          const lid = contact.lid.split('@')[0];
+          lidToPhone[lid] = phoneNumber.includes(':') ? phoneNumber.split(':')[0] : phoneNumber;
+          debugLog(`[${numero}] LID map from contact: ${lid} → ${lidToPhone[lid]}`);
+        }
 
         const cleanPhone = phoneNumber.includes(':')
           ? phoneNumber.split(':')[0]
@@ -475,16 +498,22 @@ async function guardarMensaje(numero, message) {
     const remoteJid = message.key.remoteJid;
     const isLid = remoteJid.endsWith('@lid');
 
-    // For LID messages, try to get real phone from participant or store with LID
+    // For LID messages, try to resolve to real phone number
     let cleanPhone;
     if (isLid) {
-      // Try participant field which may have the real number
-      const participant = message.key.participant;
-      if (participant && participant.endsWith('@s.whatsapp.net')) {
-        cleanPhone = participant.split('@')[0];
+      const lidNum = remoteJid.split('@')[0];
+      // Check our LID → phone map first
+      if (lidToPhone[lidNum]) {
+        cleanPhone = lidToPhone[lidNum];
+        debugLog(`[${numero}] Resolved LID ${lidNum} → ${cleanPhone} via map`);
       } else {
-        // Store with LID, will be resolved later
-        cleanPhone = remoteJid.split('@')[0];
+        // Try participant field
+        const participant = message.key.participant;
+        if (participant && participant.endsWith('@s.whatsapp.net')) {
+          cleanPhone = participant.split('@')[0];
+        } else {
+          cleanPhone = lidNum;
+        }
       }
     } else {
       const contactNumber = remoteJid.split('@')[0];
