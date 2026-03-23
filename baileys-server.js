@@ -279,13 +279,12 @@ async function startWhatsAppSession(numero) {
           debugLog(`[${numero}] QR generado`);
 
           await supabase
-            .from('whatsapp_accounts')
+            .from('wmp_whatsapp_accounts')
             .update({
               qr_code: currentQRCode,
-              connection_status: 'qr_required',
-              qr_expires_at: new Date(Date.now() + 60000).toISOString()
+              status: 'connecting',
             })
-            .eq('display_phone_number', numero);
+            .eq('phone_number', numero.replace('+', ''));
 
           broadcast('qr_update', { account: numero, qr: currentQRCode });
 
@@ -308,13 +307,12 @@ async function startWhatsAppSession(numero) {
         }
 
         await supabase
-          .from('whatsapp_accounts')
+          .from('wmp_whatsapp_accounts')
           .update({
-            connection_status: 'open',
-            last_connected_at: new Date().toISOString(),
+            status: 'connected',
             qr_code: null
           })
-          .eq('display_phone_number', numero);
+          .eq('phone_number', numero.replace('+', ''));
 
         broadcast('connection_update', { account: numero, status: 'connected' });
 
@@ -351,11 +349,11 @@ async function startWhatsAppSession(numero) {
         }
 
         await supabase
-          .from('whatsapp_accounts')
+          .from('wmp_whatsapp_accounts')
           .update({
-            connection_status: shouldReconnect ? 'reconnecting' : 'disconnected'
+            status: shouldReconnect ? 'connecting' : 'disconnected'
           })
-          .eq('display_phone_number', numero);
+          .eq('phone_number', numero.replace('+', ''));
 
         broadcast('connection_update', { account: numero, status: 'disconnected' });
       }
@@ -378,13 +376,20 @@ async function startWhatsAppSession(numero) {
   }
 }
 
+// Helper: buscar account por numero (sin +)
+async function findAccount(numero) {
+  const phoneClean = numero.replace('+', '');
+  const { data } = await supabase
+    .from('wmp_whatsapp_accounts')
+    .select('id')
+    .eq('phone_number', phoneClean)
+    .single();
+  return data;
+}
+
 async function syncContactos(numero, sock) {
   try {
-    const { data: account } = await supabase
-      .from('whatsapp_accounts')
-      .select('id')
-      .eq('display_phone_number', numero)
-      .single();
+    const account = await findAccount(numero);
 
     if (!account) {
       console.error(`WhatsAppAccount no encontrado para ${numero}`);
@@ -400,27 +405,43 @@ async function syncContactos(numero, sock) {
         const phoneNumber = contact.id.split('@')[0];
         if (phoneNumber === 'status') continue;
 
-        const fullPhone = phoneNumber.includes(':')
-          ? '+' + phoneNumber.split(':')[0]
-          : '+' + phoneNumber;
+        const cleanPhone = phoneNumber.includes(':')
+          ? phoneNumber.split(':')[0]
+          : phoneNumber;
 
-        const { error } = await supabase
-          .from('contacts')
-          .upsert({
-            full_name: contact.name || contact.notify || fullPhone,
-            phone: fullPhone,
-            phone_e164: fullPhone,
-            whatsapp_account_id: whatsapp_account_id,
-            target_phone_number: numero,
-            avatar_url: null
-          }, {
-            onConflict: 'phone,whatsapp_account_id'
-          });
+        const contactName = contact.name || contact.notify || `+${cleanPhone}`;
 
-        if (error) {
-          console.error(`Error guardando contacto ${fullPhone}:`, error);
+        // Check if contact exists
+        const { data: existing } = await supabase
+          .from('wmp_contacts')
+          .select('id')
+          .eq('phone_number', cleanPhone)
+          .eq('whatsapp_account_id', whatsapp_account_id)
+          .single();
+
+        if (existing) {
+          // Update name if we have a better one
+          if (contact.name || contact.notify) {
+            await supabase
+              .from('wmp_contacts')
+              .update({ name: contactName })
+              .eq('id', existing.id);
+          }
         } else {
-          count++;
+          const { error } = await supabase
+            .from('wmp_contacts')
+            .insert({
+              name: contactName,
+              phone_number: cleanPhone,
+              whatsapp_account_id: whatsapp_account_id,
+              unread_count: 0,
+            });
+
+          if (error) {
+            console.error(`Error guardando contacto ${cleanPhone}:`, error);
+          } else {
+            count++;
+          }
         }
       }
 
@@ -437,124 +458,94 @@ async function syncContactos(numero, sock) {
 
 async function guardarMensaje(numero, message) {
   try {
-    const { data: account } = await supabase
-      .from('whatsapp_accounts')
-      .select('id')
-      .eq('display_phone_number', numero)
-      .single();
-
+    const account = await findAccount(numero);
     if (!account) return;
 
     const contactNumber = message.key.remoteJid.split('@')[0];
-    const fullPhone = '+' + contactNumber;
+    const cleanPhone = contactNumber.includes(':')
+      ? contactNumber.split(':')[0]
+      : contactNumber;
 
-    const { data: contact } = await supabase
-      .from('contacts')
+    // Find or create contact
+    let { data: contact } = await supabase
+      .from('wmp_contacts')
       .select('id')
-      .eq('phone', fullPhone)
+      .eq('phone_number', cleanPhone)
       .eq('whatsapp_account_id', account.id)
       .single();
 
-    let contactId = contact?.id;
-
-    if (!contactId) {
+    if (!contact) {
       const { data: newContact } = await supabase
-        .from('contacts')
+        .from('wmp_contacts')
         .insert({
-          full_name: fullPhone,
-          phone: fullPhone,
-          phone_e164: fullPhone,
+          name: `+${cleanPhone}`,
+          phone_number: cleanPhone,
           whatsapp_account_id: account.id,
-          target_phone_number: numero
+          unread_count: 0,
         })
         .select('id')
         .single();
 
-      contactId = newContact?.id;
+      contact = newContact;
     }
 
-    if (!contactId) return;
+    if (!contact) return;
 
-    let conversationId;
-    const { data: convo } = await supabase
-      .from('conversations')
-      .select('id')
-      .eq('contact_id', contactId)
-      .eq('whatsapp_account_id', account.id)
-      .single();
-
-    if (convo) {
-      conversationId = convo.id;
-    } else {
-      const { data: newConvo } = await supabase
-        .from('conversations')
-        .insert({
-          contact_id: contactId,
-          whatsapp_account_id: account.id,
-          platform: 'whatsapp',
-          status: 'open'
-        })
-        .select('id')
-        .single();
-
-      conversationId = newConvo?.id;
-    }
-
-    if (!conversationId) return;
-
+    // Extract message content
     let content = '';
-    let messageType = 'text';
-
     if (message.message.conversation) {
       content = message.message.conversation;
     } else if (message.message.extendedTextMessage) {
       content = message.message.extendedTextMessage.text;
     } else if (message.message.imageMessage) {
       content = message.message.imageMessage.caption || '[Imagen]';
-      messageType = 'image';
     } else if (message.message.documentMessage) {
       content = `[Documento: ${message.message.documentMessage.fileName}]`;
-      messageType = 'document';
     } else if (message.message.audioMessage) {
       content = '[Audio]';
-      messageType = 'audio';
+    } else if (message.message.videoMessage) {
+      content = message.message.videoMessage.caption || '[Video]';
+    } else if (message.message.stickerMessage) {
+      content = '[Sticker]';
+    } else if (message.message.locationMessage) {
+      content = '[Ubicacion]';
+    } else if (message.message.contactMessage) {
+      content = '[Contacto]';
     } else {
       content = '[Mensaje no soportado]';
     }
 
+    // Insert message
     await supabase
-      .from('messages')
+      .from('wmp_messages')
       .insert({
-        conversation_id: conversationId,
+        contact_id: contact.id,
         whatsapp_account_id: account.id,
-        direction: 'inbound',
-        provider: 'baileys',
-        provider_message_id: message.key.id,
-        from_e164: fullPhone,
-        to_e164: numero,
-        sender_type: 'contact',
-        sender_id: contactId,
-        sender_name: contact?.full_name || fullPhone,
-        type: messageType,
         content: content,
-        status: 'received',
-        timestamp: new Date(message.messageTimestamp * 1000).toISOString()
+        direction: 'inbound',
+        sender_type: 'contact',
       });
 
+    // Update contact: last_message_at and unread_count
+    const { data: unreadData } = await supabase
+      .from('wmp_messages')
+      .select('id', { count: 'exact', head: true })
+      .eq('contact_id', contact.id)
+      .eq('direction', 'inbound');
+
     await supabase
-      .from('conversations')
+      .from('wmp_contacts')
       .update({
         last_message_at: new Date().toISOString(),
-        last_message_preview: content.substring(0, 50),
-        unread_count: (await getUnreadCount(conversationId)) + 1
+        unread_count: (unreadData?.length || 0),
       })
-      .eq('id', conversationId);
+      .eq('id', contact.id);
 
-    // Notificar a clientes SSE del nuevo mensaje
+    // Notify SSE clients
     broadcast('new_message', {
       account: numero,
-      contact_phone: fullPhone,
-      conversation_id: conversationId,
+      contact_phone: cleanPhone,
+      contact_id: contact.id,
     });
 
   } catch (error) {
@@ -562,25 +553,15 @@ async function guardarMensaje(numero, message) {
   }
 }
 
-async function getUnreadCount(conversationId) {
-  const { data } = await supabase
-    .from('messages')
-    .select('id', { count: 'exact' })
-    .eq('conversation_id', conversationId)
-    .eq('status', 'received')
-    .eq('direction', 'inbound');
-
-  return data?.length || 0;
-}
-
 app.get('/api/whatsapp/qr/:numero', async (req, res) => {
   const numero = normalizePhone(req.params.numero);
+  const phoneClean = numero.replace('+', '');
 
   try {
     const { data } = await supabase
-      .from('whatsapp_accounts')
-      .select('qr_code, connection_status')
-      .eq('display_phone_number', numero)
+      .from('wmp_whatsapp_accounts')
+      .select('qr_code, status')
+      .eq('phone_number', phoneClean)
       .single();
 
     if (!data) {
@@ -590,7 +571,7 @@ app.get('/api/whatsapp/qr/:numero', async (req, res) => {
     res.json({
       numero,
       qr: data.qr_code,
-      estado: data.connection_status
+      estado: data.status
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -627,24 +608,25 @@ app.post('/api/whatsapp/connect/:numero', async (req, res) => {
   const numero = normalizePhone(req.params.numero);
 
   try {
+    const phoneClean = numero.replace('+', '');
     // Verificar si existe en Supabase, si no, auto-crear
     const { data: existing } = await supabase
-      .from('whatsapp_accounts')
+      .from('wmp_whatsapp_accounts')
       .select('id')
-      .eq('display_phone_number', numero)
+      .eq('phone_number', phoneClean)
       .single();
 
     if (!existing) {
-      console.log(`[${numero}] Auto-creando registro en whatsapp_accounts`);
-      await supabase.from('whatsapp_accounts').insert({
-        name: numero,
-        display_phone_number: numero,
-        connection_status: 'connecting',
+      console.log(`[${numero}] Auto-creando registro en wmp_whatsapp_accounts`);
+      await supabase.from('wmp_whatsapp_accounts').insert({
+        phone_number: phoneClean,
+        label: numero,
+        status: 'connecting',
       });
     } else {
-      await supabase.from('whatsapp_accounts')
-        .update({ connection_status: 'connecting' })
-        .eq('display_phone_number', numero);
+      await supabase.from('wmp_whatsapp_accounts')
+        .update({ status: 'connecting' })
+        .eq('phone_number', phoneClean);
     }
 
     // Cerrar sesión anterior si existe
@@ -698,12 +680,13 @@ app.post('/api/whatsapp/connect/:numero', async (req, res) => {
 
 app.get('/api/whatsapp/status/:numero', async (req, res) => {
   const numero = normalizePhone(req.params.numero);
+  const phoneClean = numero.replace('+', '');
 
   try {
     const { data } = await supabase
-      .from('whatsapp_accounts')
-      .select('connection_status, last_connected_at')
-      .eq('display_phone_number', numero)
+      .from('wmp_whatsapp_accounts')
+      .select('status, created_at')
+      .eq('phone_number', phoneClean)
       .single();
 
     if (!data) {
@@ -712,8 +695,8 @@ app.get('/api/whatsapp/status/:numero', async (req, res) => {
 
     res.json({
       numero,
-      status: data.connection_status,
-      last_connected: data.last_connected_at
+      status: data.status,
+      last_connected: data.created_at
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -725,29 +708,33 @@ app.get('/api/whatsapp/mensajes/:numero', async (req, res) => {
   const { contacto, limite = 50 } = req.query;
 
   try {
-    const { data: account } = await supabase
-      .from('whatsapp_accounts')
-      .select('id')
-      .eq('display_phone_number', numero)
-      .single();
-
+    const account = await findAccount(numero);
     if (!account) {
       return res.status(404).json({ error: 'Número no encontrado' });
     }
 
     let query = supabase
-      .from('messages')
+      .from('wmp_messages')
       .select('*')
       .eq('whatsapp_account_id', account.id)
-      .order('timestamp', { ascending: false })
+      .order('created_at', { ascending: false })
       .limit(parseInt(limite));
 
     if (contacto) {
-      query = query.eq('from_e164', contacto);
+      // Find contact by phone
+      const { data: contact } = await supabase
+        .from('wmp_contacts')
+        .select('id')
+        .eq('phone_number', contacto.replace('+', ''))
+        .eq('whatsapp_account_id', account.id)
+        .single();
+
+      if (contact) {
+        query = query.eq('contact_id', contact.id);
+      }
     }
 
     const { data, error } = await query;
-
     if (error) throw error;
 
     res.json({
@@ -766,8 +753,8 @@ app.post('/api/whatsapp/enviar', async (req, res) => {
   const { contacto, mensaje } = req.body;
 
   if (!numero || !contacto || !mensaje) {
-    return res.status(400).json({ 
-      error: 'Faltan parámetros: numero, contacto, mensaje' 
+    return res.status(400).json({
+      error: 'Faltan parámetros: numero, contacto, mensaje'
     });
   }
 
@@ -775,62 +762,40 @@ app.post('/api/whatsapp/enviar', async (req, res) => {
     const session = activeSessions[numero];
 
     if (!session || !session.socket) {
-      return res.status(400).json({ 
-        error: `No hay sesión activa para ${numero}` 
+      return res.status(400).json({
+        error: `No hay sesión activa para ${numero}`
       });
     }
 
     const jid = contacto.replace('+', '') + '@s.whatsapp.net';
-
     const sentMsg = await session.socket.sendMessage(jid, { text: mensaje });
 
-    const { data: account } = await supabase
-      .from('whatsapp_accounts')
-      .select('id')
-      .eq('display_phone_number', numero)
-      .single();
+    const account = await findAccount(numero);
+    const cleanContacto = contacto.replace('+', '');
 
-    const { data: contact } = await supabase
-      .from('contacts')
-      .select('id')
-      .eq('phone', contacto)
-      .eq('whatsapp_account_id', account.id)
-      .single();
-
-    if (account && contact) {
-      const { data: convo } = await supabase
-        .from('conversations')
+    if (account) {
+      const { data: contact } = await supabase
+        .from('wmp_contacts')
         .select('id')
-        .eq('contact_id', contact.id)
+        .eq('phone_number', cleanContacto)
         .eq('whatsapp_account_id', account.id)
         .single();
 
-      if (convo) {
+      if (contact) {
         await supabase
-          .from('messages')
+          .from('wmp_messages')
           .insert({
-            conversation_id: convo.id,
+            contact_id: contact.id,
             whatsapp_account_id: account.id,
-            direction: 'outbound',
-            provider: 'baileys',
-            provider_message_id: sentMsg.key.id,
-            from_e164: numero,
-            to_e164: contacto,
-            sender_type: 'agent',
-            sender_name: 'Agente',
-            type: 'text',
             content: mensaje,
-            status: 'sent',
-            timestamp: new Date().toISOString()
+            direction: 'outbound',
+            sender_type: 'agent',
           });
 
         await supabase
-          .from('conversations')
-          .update({
-            last_message_at: new Date().toISOString(),
-            last_message_preview: mensaje.substring(0, 50)
-          })
-          .eq('id', convo.id);
+          .from('wmp_contacts')
+          .update({ last_message_at: new Date().toISOString() })
+          .eq('id', contact.id);
       }
     }
 
@@ -847,21 +812,16 @@ app.get('/api/whatsapp/contactos/:numero', async (req, res) => {
   const numero = normalizePhone(req.params.numero);
 
   try {
-    const { data: account } = await supabase
-      .from('whatsapp_accounts')
-      .select('id')
-      .eq('display_phone_number', numero)
-      .single();
-
+    const account = await findAccount(numero);
     if (!account) {
       return res.status(404).json({ error: 'Número no encontrado' });
     }
 
     const { data, error } = await supabase
-      .from('contacts')
+      .from('wmp_contacts')
       .select('*')
       .eq('whatsapp_account_id', account.id)
-      .order('last_contact_date', { ascending: false });
+      .order('last_message_at', { ascending: false, nullsFirst: false });
 
     if (error) throw error;
 
@@ -918,15 +878,16 @@ app.listen(PORT, async () => {
   // Auto-reconectar sesiones que estaban conectadas antes del reinicio
   try {
     const { data: activeAccounts } = await supabase
-      .from('whatsapp_accounts')
-      .select('display_phone_number')
-      .eq('connection_status', 'open');
+      .from('wmp_whatsapp_accounts')
+      .select('phone_number')
+      .eq('status', 'connected');
 
     for (const acc of activeAccounts || []) {
-      console.log(`🔄 Reconectando ${acc.display_phone_number}...`);
-      startWhatsAppSession(acc.display_phone_number)
-        .then(({ sock }) => console.log(`✅ Reconexión iniciada para ${acc.display_phone_number}`))
-        .catch(err => console.error(`Error reconectando ${acc.display_phone_number}:`, err));
+      const numero = normalizePhone(acc.phone_number);
+      console.log(`🔄 Reconectando ${numero}...`);
+      startWhatsAppSession(numero)
+        .then(() => console.log(`✅ Reconexión iniciada para ${numero}`))
+        .catch(err => console.error(`Error reconectando ${numero}:`, err));
     }
   } catch (err) {
     console.error('Error en auto-reconexión:', err);
