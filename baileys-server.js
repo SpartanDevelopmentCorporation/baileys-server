@@ -780,13 +780,59 @@ async function handleAIResponse(numero, contactId, accountId, content) {
     const jid = isLid ? `${phoneOrLid}@lid` : `${phoneOrLid}@s.whatsapp.net`;
 
     try {
-      await session.socket.sendMessage(jid, { text: suggestion });
+      // Parse and extract customer data from AI response
+      const dataMatch = suggestion.match(/\[DATOS:\s*(.+?)\]/);
+      let cleanSuggestion = suggestion.replace(/\[DATOS:\s*.+?\]/, '').trim();
 
-      // Save AI message to DB
+      if (dataMatch) {
+        const dataStr = dataMatch[1];
+        const updates = {};
+        const fieldMap = {
+          'nombre': 'name',
+          'telefono': 'phone_number',
+          'email': 'email',
+          'destino_pais': 'destination_country',
+          'destino_ciudad': 'destination_city',
+          'zip': 'zip_code',
+          'origen_estado': 'origin_state',
+          'origen_ciudad': 'origin_city',
+          'servicio': 'service_type',
+          'notas': 'notes',
+        };
+
+        for (const pair of dataStr.split(',')) {
+          const [key, ...valParts] = pair.split('=');
+          const val = valParts.join('=').trim();
+          const dbField = fieldMap[key.trim()];
+          if (dbField && val) updates[dbField] = val;
+        }
+
+        if (Object.keys(updates).length > 0) {
+          // Don't overwrite phone_number if contact already has a real one
+          if (updates.phone_number) {
+            const { data: existing } = await supabase
+              .from('wmp_contacts')
+              .select('phone_number')
+              .eq('id', contactId)
+              .single();
+            if (existing?.phone_number && existing.phone_number.length < 15) {
+              delete updates.phone_number;
+            }
+          }
+          if (Object.keys(updates).length > 0) {
+            await supabase.from('wmp_contacts').update(updates).eq('id', contactId);
+            debugLog(`[${numero}] 📋 Client data saved: ${JSON.stringify(updates)}`);
+          }
+        }
+      }
+
+      await session.socket.sendMessage(jid, { text: cleanSuggestion || suggestion });
+
+      // Save AI message to DB (without the [DATOS:] tag)
       await supabase.from('wmp_messages').insert({
         contact_id: contactId,
         whatsapp_account_id: accountId,
-        content: suggestion,
+        content: cleanSuggestion || suggestion,
         direction: 'outbound',
         sender_type: 'ai',
       });
