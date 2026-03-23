@@ -626,8 +626,182 @@ async function guardarMensaje(numero, message) {
       contact_id: contact.id,
     });
 
+    // Trigger AI response (async, don't block message processing)
+    handleAIResponse(numero, contact.id, account.id, content).catch(err => {
+      debugLog(`[${numero}] AI handler error: ${err.message}`);
+    });
+
   } catch (error) {
     console.error('Error guardando mensaje:', error);
+  }
+}
+
+// === AI INTEGRATION ===
+
+function isWithinBusinessHours() {
+  const now = new Date();
+  // Convert to Eastern Time
+  const eastern = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const day = eastern.getDay(); // 0=Sunday
+  const hour = eastern.getHours();
+  const minute = eastern.getMinutes();
+  const time = hour * 60 + minute;
+
+  // Saturday: 9am-6pm
+  if (day === 6) return time >= 540 && time < 1080;
+  // Sunday-Friday: 9am-9pm
+  return time >= 540 && time < 1260;
+}
+
+async function getAIResponse(contactId, accountId, incomingMessage) {
+  try {
+    // Get AI config
+    const { data: aiConfig } = await supabase
+      .from('wmp_ai_config')
+      .select('*')
+      .eq('is_active', true)
+      .single();
+
+    if (!aiConfig || !aiConfig.api_key) {
+      debugLog('AI not configured or no API key');
+      return null;
+    }
+
+    const withinHours = isWithinBusinessHours();
+
+    // If within business hours and copilot mode, just save suggestion (don't auto-reply)
+    if (withinHours && aiConfig.copilot_enabled && !aiConfig.auto_reply_when_absent) {
+      debugLog('Within business hours, copilot mode — skipping auto-reply');
+      return null;
+    }
+
+    // If within business hours and copilot enabled, save suggestion for agent
+    if (withinHours && aiConfig.copilot_enabled) {
+      debugLog('Within business hours, generating suggestion for agent');
+    }
+
+    // Get knowledge base
+    const { data: knowledge } = await supabase
+      .from('wmp_ai_knowledge_base')
+      .select('title, content');
+
+    // Get recent messages for context
+    const { data: messages } = await supabase
+      .from('wmp_messages')
+      .select('content, direction, sender_type, created_at')
+      .eq('contact_id', contactId)
+      .order('created_at', { ascending: false })
+      .limit(20);
+
+    const sortedMessages = [...(messages || [])].reverse();
+
+    // Get contact info
+    const { data: contact } = await supabase
+      .from('wmp_contacts')
+      .select('name, phone_number')
+      .eq('id', contactId)
+      .single();
+
+    // Build conversation for OpenAI
+    const conversationHistory = sortedMessages.map(m => ({
+      role: m.direction === 'inbound' ? 'user' : 'assistant',
+      content: m.content || '',
+    }));
+
+    const knowledgeContext = (knowledge || [])
+      .map(k => `## ${k.title}\n${k.content}`)
+      .join('\n\n');
+
+    const systemPrompt = `${aiConfig.system_prompt}\n\nBASE DE CONOCIMIENTO:\n${knowledgeContext}\n\nINFORMACIÓN DEL CLIENTE:\n- Nombre: ${contact?.name || 'Desconocido'}\n- Teléfono: ${contact?.phone_number || 'No disponible'}`;
+
+    // Call OpenAI
+    const openaiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${aiConfig.api_key}`,
+      },
+      body: JSON.stringify({
+        model: aiConfig.model || 'gpt-4o-mini',
+        temperature: aiConfig.temperature || 0.7,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          ...conversationHistory,
+        ],
+        max_tokens: 500,
+      }),
+    });
+
+    if (!openaiResponse.ok) {
+      const err = await openaiResponse.text();
+      debugLog(`OpenAI error: ${err}`);
+      return null;
+    }
+
+    const data = await openaiResponse.json();
+    const suggestion = data.choices?.[0]?.message?.content || '';
+
+    if (!suggestion) return null;
+
+    return { suggestion, withinHours, autoReply: !withinHours && aiConfig.auto_reply_when_absent };
+  } catch (error) {
+    debugLog(`AI error: ${error.message}`);
+    return null;
+  }
+}
+
+async function handleAIResponse(numero, contactId, accountId, content) {
+  const aiResult = await getAIResponse(contactId, accountId, content);
+  if (!aiResult) return;
+
+  const { suggestion, withinHours, autoReply } = aiResult;
+
+  if (autoReply) {
+    // Outside business hours — send automatically
+    debugLog(`[${numero}] AI auto-reply: ${suggestion.substring(0, 50)}...`);
+
+    const session = activeSessions[numero];
+    if (!session?.socket) {
+      debugLog(`[${numero}] No active session for AI auto-reply`);
+      return;
+    }
+
+    // Get contact to find JID
+    const { data: contact } = await supabase
+      .from('wmp_contacts')
+      .select('phone_number, lid')
+      .eq('id', contactId)
+      .single();
+
+    if (!contact) return;
+
+    const phoneOrLid = contact.lid || contact.phone_number;
+    const isLid = phoneOrLid.length >= 15;
+    const jid = isLid ? `${phoneOrLid}@lid` : `${phoneOrLid}@s.whatsapp.net`;
+
+    try {
+      await session.socket.sendMessage(jid, { text: suggestion });
+
+      // Save AI message to DB
+      await supabase.from('wmp_messages').insert({
+        contact_id: contactId,
+        whatsapp_account_id: accountId,
+        content: suggestion,
+        direction: 'outbound',
+        sender_type: 'ai',
+      });
+
+      debugLog(`[${numero}] ✅ AI auto-reply sent`);
+    } catch (err) {
+      debugLog(`[${numero}] ❌ AI auto-reply failed: ${err.message}`);
+    }
+  } else if (withinHours) {
+    // Within business hours — save suggestion for agent
+    debugLog(`[${numero}] AI suggestion saved for agent`);
+    broadcast('ai_suggestion', {
+      contact_id: contactId,
+      suggestion: suggestion,
+    });
   }
 }
 
