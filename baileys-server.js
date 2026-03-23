@@ -383,18 +383,41 @@ async function startWhatsAppSession(numero) {
         const remoteJid = message.key.remoteJid;
         debugLog(`[${numero}] msg: fromMe=${fromMe}, hasMessage=${hasMsg}, jid=${remoteJid}`);
 
-        if (!fromMe && hasMsg) {
+        if (hasMsg) {
           // Dedup: skip if already processed
           const msgId = message.key.id;
           if (isProcessed(msgId)) {
             debugLog(`[${numero}] ⏭ Duplicate message skipped: ${msgId}`);
             continue;
           }
-          try {
-            await guardarMensaje(numero, message);
-            debugLog(`[${numero}] ✅ Mensaje guardado de ${remoteJid}`);
-          } catch (err) {
-            debugLog(`[${numero}] ❌ Error guardando mensaje: ${err.message}`);
+
+          // Skip group messages
+          if (remoteJid && remoteJid.endsWith('@g.us')) {
+            debugLog(`[${numero}] ⏭ Grupo ignorado: ${remoteJid}`);
+            continue;
+          }
+
+          // Skip status/broadcast
+          if (remoteJid === 'status@broadcast') {
+            continue;
+          }
+
+          if (fromMe) {
+            // Message sent from phone — save as outbound (agent)
+            try {
+              await guardarMensaje(numero, message, true);
+              debugLog(`[${numero}] ✅ Mensaje propio guardado de ${remoteJid}`);
+            } catch (err) {
+              debugLog(`[${numero}] ❌ Error guardando mensaje propio: ${err.message}`);
+            }
+          } else {
+            // Incoming message
+            try {
+              await guardarMensaje(numero, message, false);
+              debugLog(`[${numero}] ✅ Mensaje guardado de ${remoteJid}`);
+            } catch (err) {
+              debugLog(`[${numero}] ❌ Error guardando mensaje: ${err.message}`);
+            }
           }
         }
       }
@@ -512,7 +535,7 @@ async function syncContactos(numero, sock) {
   }
 }
 
-async function guardarMensaje(numero, message) {
+async function guardarMensaje(numero, message, isFromMe = false) {
   try {
     const account = await findAccount(numero);
     if (!account) return;
@@ -747,8 +770,8 @@ async function guardarMensaje(numero, message) {
       contact_id: contact.id,
       whatsapp_account_id: account.id,
       content: content || '',
-      direction: 'inbound',
-      sender_type: 'customer',
+      direction: isFromMe ? 'outbound' : 'inbound',
+      sender_type: isFromMe ? 'agent' : 'customer',
     };
     if (media_url) insertData.media_url = media_url;
     if (media_type) insertData.media_type = media_type;
@@ -763,20 +786,28 @@ async function guardarMensaje(numero, message) {
       return;
     }
 
-    // Get current unread count and increment
-    const { data: currentContact } = await supabase
-      .from('wmp_contacts')
-      .select('unread_count')
-      .eq('id', contact.id)
-      .single();
+    // Update last_message_at always, but only increment unread for inbound
+    if (!isFromMe) {
+      const { data: currentContact } = await supabase
+        .from('wmp_contacts')
+        .select('unread_count')
+        .eq('id', contact.id)
+        .single();
 
-    await supabase
-      .from('wmp_contacts')
-      .update({
-        last_message_at: new Date().toISOString(),
-        unread_count: ((currentContact?.unread_count || 0) + 1),
-      })
-      .eq('id', contact.id);
+      await supabase
+        .from('wmp_contacts')
+        .update({
+          last_message_at: new Date().toISOString(),
+          unread_count: ((currentContact?.unread_count || 0) + 1),
+        })
+        .eq('id', contact.id);
+    } else {
+      // Just update last_message_at for outbound
+      await supabase
+        .from('wmp_contacts')
+        .update({ last_message_at: new Date().toISOString() })
+        .eq('id', contact.id);
+    }
 
     // Notify SSE clients
     broadcast('new_message', {
@@ -785,10 +816,12 @@ async function guardarMensaje(numero, message) {
       contact_id: contact.id,
     });
 
-    // Trigger AI response (async, don't block message processing)
-    handleAIResponse(numero, contact.id, account.id, content).catch(err => {
-      debugLog(`[${numero}] AI handler error: ${err.message}`);
-    });
+    // Only trigger AI for inbound messages
+    if (!isFromMe) {
+      handleAIResponse(numero, contact.id, account.id, content).catch(err => {
+        debugLog(`[${numero}] AI handler error: ${err.message}`);
+      });
+    }
 
   } catch (error) {
     console.error('Error guardando mensaje:', error);
