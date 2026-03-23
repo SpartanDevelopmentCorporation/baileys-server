@@ -861,14 +861,25 @@ async function handleAIResponse(numero, contactId, accountId, content) {
         await session.socket.sendMessage(jid, { text: clientMessage });
       }
 
-      // Save full message (with tasks) to DB for agents to see
+      // Save client-visible message to DB
       await supabase.from('wmp_messages').insert({
         contact_id: contactId,
         whatsapp_account_id: accountId,
-        content: cleanSuggestion || suggestion,
+        content: clientMessage || cleanSuggestion || suggestion,
         direction: 'outbound',
         sender_type: 'ai',
       });
+
+      // If there's a task for agents, send it to internal chat
+      if (agentTask) {
+        const contactName = contact.name || contact.phone_number || 'Desconocido';
+        await supabase.from('wmp_internal_messages').insert({
+          sender_email: 'paquita@paquetex.net',
+          sender_name: 'Paquita (IA)',
+          content: `📋 ${agentTask}\n\n👤 Cliente: ${contactName}\n📞 Tel: ${contact.phone_number || 'No disponible'}`,
+        });
+        debugLog(`[${numero}] 📋 Task enviado al chat interno`);
+      }
 
       debugLog(`[${numero}] ✅ AI auto-reply sent`);
     } catch (err) {
