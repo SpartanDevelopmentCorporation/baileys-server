@@ -86,6 +86,19 @@ let activeSessions = {};
 // Map LID → real phone number
 const lidToPhone = {};
 
+// Dedup: track processed message IDs to avoid duplicates
+const processedMessages = new Set();
+function isProcessed(msgId) {
+  if (processedMessages.has(msgId)) return true;
+  processedMessages.add(msgId);
+  // Keep set small — clear old entries after 1000
+  if (processedMessages.size > 1000) {
+    const arr = [...processedMessages];
+    arr.splice(0, 500).forEach(id => processedMessages.delete(id));
+  }
+  return false;
+}
+
 // SSE - Server-Sent Events para actualizaciones en tiempo real
 const sseClients = new Set();
 
@@ -371,6 +384,12 @@ async function startWhatsAppSession(numero) {
         debugLog(`[${numero}] msg: fromMe=${fromMe}, hasMessage=${hasMsg}, jid=${remoteJid}`);
 
         if (!fromMe && hasMsg) {
+          // Dedup: skip if already processed
+          const msgId = message.key.id;
+          if (isProcessed(msgId)) {
+            debugLog(`[${numero}] ⏭ Duplicate message skipped: ${msgId}`);
+            continue;
+          }
           try {
             await guardarMensaje(numero, message);
             debugLog(`[${numero}] ✅ Mensaje guardado de ${remoteJid}`);
@@ -828,9 +847,21 @@ async function handleAIResponse(numero, contactId, accountId, content) {
         }
       }
 
-      await session.socket.sendMessage(jid, { text: cleanSuggestion || suggestion });
+      // Separate TAREAS PARA AGENTE from client-visible message
+      let clientMessage = (cleanSuggestion || suggestion);
+      const taskMatch = clientMessage.match(/TAREAS?\s*PARA\s*AGENTE[S]?:\s*([\s\S]*?)(?=\n\n|$)/i);
+      let agentTask = null;
+      if (taskMatch) {
+        agentTask = taskMatch[0].trim();
+        clientMessage = clientMessage.replace(taskMatch[0], '').trim();
+      }
 
-      // Save AI message to DB (without the [DATOS:] tag)
+      // Send only client-visible part to WhatsApp
+      if (clientMessage) {
+        await session.socket.sendMessage(jid, { text: clientMessage });
+      }
+
+      // Save full message (with tasks) to DB for agents to see
       await supabase.from('wmp_messages').insert({
         contact_id: contactId,
         whatsapp_account_id: accountId,
