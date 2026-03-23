@@ -527,7 +527,7 @@ async function guardarMensaje(numero, message) {
     }
 
     // Insert message
-    await supabase
+    const { error: msgError } = await supabase
       .from('wmp_messages')
       .insert({
         contact_id: contact.id,
@@ -536,6 +536,11 @@ async function guardarMensaje(numero, message) {
         direction: 'inbound',
         sender_type: 'contact',
       });
+
+    if (msgError) {
+      console.error(`❌ Error insertando mensaje:`, msgError);
+      return;
+    }
 
     // Update contact: last_message_at and unread_count
     const { data: unreadData } = await supabase
