@@ -83,22 +83,6 @@ let sock = null;
 let currentQRCode = null;
 let activeSessions = {};
 
-// Map LID → real phone number
-const lidToPhone = {};
-
-// Dedup: track processed message IDs to avoid duplicates
-const processedMessages = new Set();
-function isProcessed(msgId) {
-  if (processedMessages.has(msgId)) return true;
-  processedMessages.add(msgId);
-  // Keep set small — clear old entries after 1000
-  if (processedMessages.size > 1000) {
-    const arr = [...processedMessages];
-    arr.splice(0, 500).forEach(id => processedMessages.delete(id));
-  }
-  return false;
-}
-
 // SSE - Server-Sent Events para actualizaciones en tiempo real
 const sseClients = new Set();
 
@@ -376,50 +360,10 @@ async function startWhatsAppSession(numero) {
     });
 
     sock.ev.on('messages.upsert', async (m) => {
-      debugLog(`[${numero}] messages.upsert: ${m.messages.length} mensajes, type: ${m.type}`);
-      for (const message of m.messages) {
-        const fromMe = message.key.fromMe;
-        const hasMsg = !!message.message;
-        const remoteJid = message.key.remoteJid;
-        debugLog(`[${numero}] msg: fromMe=${fromMe}, hasMessage=${hasMsg}, jid=${remoteJid}`);
+      const message = m.messages[0];
 
-        if (hasMsg) {
-          // Dedup: skip if already processed
-          const msgId = message.key.id;
-          if (isProcessed(msgId)) {
-            debugLog(`[${numero}] ⏭ Duplicate message skipped: ${msgId}`);
-            continue;
-          }
-
-          // Skip group messages
-          if (remoteJid && remoteJid.endsWith('@g.us')) {
-            debugLog(`[${numero}] ⏭ Grupo ignorado: ${remoteJid}`);
-            continue;
-          }
-
-          // Skip status/broadcast
-          if (remoteJid === 'status@broadcast') {
-            continue;
-          }
-
-          if (fromMe) {
-            // Message sent from phone — save as outbound (agent)
-            try {
-              await guardarMensaje(numero, message, true);
-              debugLog(`[${numero}] ✅ Mensaje propio guardado de ${remoteJid}`);
-            } catch (err) {
-              debugLog(`[${numero}] ❌ Error guardando mensaje propio: ${err.message}`);
-            }
-          } else {
-            // Incoming message
-            try {
-              await guardarMensaje(numero, message, false);
-              debugLog(`[${numero}] ✅ Mensaje guardado de ${remoteJid}`);
-            } catch (err) {
-              debugLog(`[${numero}] ❌ Error guardando mensaje: ${err.message}`);
-            }
-          }
-        }
+      if (!message.key.fromMe && message.message) {
+        await guardarMensaje(numero, message);
       }
     });
 
@@ -454,32 +398,12 @@ async function syncContactos(numero, sock) {
 
     const whatsapp_account_id = account.id;
 
-    // Build LID → phone map from contacts.update events
-    sock.ev.on('contacts.update', async (updates) => {
-      for (const update of updates) {
-        // contacts.update may contain lid ↔ phone mappings
-        if (update.id && update.lid) {
-          const phone = update.id.split('@')[0];
-          const lid = update.lid.split('@')[0];
-          lidToPhone[lid] = phone;
-          debugLog(`[${numero}] LID map: ${lid} → ${phone}`);
-        }
-      }
-    });
-
     // En Baileys v7, los contactos llegan por el evento 'contacts.upsert'
     sock.ev.on('contacts.upsert', async (contacts) => {
       let count = 0;
       for (const contact of contacts) {
         const phoneNumber = contact.id.split('@')[0];
         if (phoneNumber === 'status') continue;
-
-        // Build LID → phone map
-        const contactLid = contact.lid ? contact.lid.split('@')[0] : null;
-        if (contactLid) {
-          const realPhone = phoneNumber.includes(':') ? phoneNumber.split(':')[0] : phoneNumber;
-          lidToPhone[contactLid] = realPhone;
-        }
 
         const cleanPhone = phoneNumber.includes(':')
           ? phoneNumber.split(':')[0]
@@ -496,14 +420,11 @@ async function syncContactos(numero, sock) {
           .single();
 
         if (existing) {
-          // Update name and LID if we have them
-          const updateData = {};
-          if (contact.name || contact.notify) updateData.name = contactName;
-          if (contactLid) updateData.lid = contactLid;
-          if (Object.keys(updateData).length > 0) {
+          // Update name if we have a better one
+          if (contact.name || contact.notify) {
             await supabase
               .from('wmp_contacts')
-              .update(updateData)
+              .update({ name: contactName })
               .eq('id', existing.id);
           }
         } else {
@@ -535,59 +456,23 @@ async function syncContactos(numero, sock) {
   }
 }
 
-async function guardarMensaje(numero, message, isFromMe = false) {
+async function guardarMensaje(numero, message) {
   try {
     const account = await findAccount(numero);
     if (!account) return;
 
-    const remoteJid = message.key.remoteJid;
-    const isLid = remoteJid.endsWith('@lid');
+    const contactNumber = message.key.remoteJid.split('@')[0];
+    const cleanPhone = contactNumber.includes(':')
+      ? contactNumber.split(':')[0]
+      : contactNumber;
 
-    let cleanPhone;
-    let contact = null;
-
-    if (isLid) {
-      const lidNum = remoteJid.split('@')[0];
-
-      // First: try to find contact by LID column in DB
-      const { data: lidContact } = await supabase
-        .from('wmp_contacts')
-        .select('id, phone_number')
-        .eq('lid', lidNum)
-        .eq('whatsapp_account_id', account.id)
-        .single();
-
-      if (lidContact) {
-        contact = lidContact;
-        cleanPhone = lidContact.phone_number;
-        debugLog(`[${numero}] Resolved LID ${lidNum} → ${cleanPhone} via DB`);
-      } else if (lidToPhone[lidNum]) {
-        // Second: try in-memory map
-        cleanPhone = lidToPhone[lidNum];
-        debugLog(`[${numero}] Resolved LID ${lidNum} → ${cleanPhone} via map`);
-      } else {
-        // Fallback: store with LID as phone
-        cleanPhone = lidNum;
-        debugLog(`[${numero}] Could not resolve LID ${lidNum}, storing as-is`);
-      }
-    } else {
-      const contactNumber = remoteJid.split('@')[0];
-      cleanPhone = contactNumber.includes(':')
-        ? contactNumber.split(':')[0]
-        : contactNumber;
-    }
-
-    // Find contact by phone if not already found via LID
-    if (!contact) {
-      const { data: phoneContact } = await supabase
-        .from('wmp_contacts')
-        .select('id')
-        .eq('phone_number', cleanPhone)
-        .eq('whatsapp_account_id', account.id)
-        .single();
-
-      contact = phoneContact;
-    }
+    // Find or create contact
+    let { data: contact } = await supabase
+      .from('wmp_contacts')
+      .select('id')
+      .eq('phone_number', cleanPhone)
+      .eq('whatsapp_account_id', account.id)
+      .single();
 
     if (!contact) {
       const { data: newContact } = await supabase
@@ -606,208 +491,55 @@ async function guardarMensaje(numero, message, isFromMe = false) {
 
     if (!contact) return;
 
-    // Extract message content and media
+    // Extract message content
     let content = '';
-    let media_url = null;
-    let media_type = null;
-    const msg = message.message;
-
-    if (msg.conversation) {
-      content = msg.conversation;
-    } else if (msg.extendedTextMessage) {
-      content = msg.extendedTextMessage.text;
-    } else if (msg.imageMessage) {
-      content = msg.imageMessage.caption || '';
-      media_type = 'image';
-      try {
-        const baileys = await import('@whiskeysockets/baileys');
-        const buffer = await baileys.downloadMediaMessage(message, 'buffer', {}, {
-          logger: console,
-          reuploadRequest: activeSessions[numero]?.sock?.updateMediaMessage,
-        });
-        if (buffer) {
-          const ext = msg.imageMessage.mimetype?.split('/')[1] || 'jpg';
-          const fileName = `media/${numero}/${Date.now()}.${ext}`;
-          const { error: uploadErr } = await supabase.storage
-            .from('whatsapp-media')
-            .upload(fileName, buffer, { contentType: msg.imageMessage.mimetype || 'image/jpeg' });
-          if (!uploadErr) {
-            const { data: urlData } = supabase.storage.from('whatsapp-media').getPublicUrl(fileName);
-            media_url = urlData.publicUrl;
-            debugLog(`[${numero}] 📷 Imagen subida: ${media_url}`);
-          } else {
-            debugLog(`[${numero}] ❌ Error subiendo imagen: ${uploadErr.message}`);
-            content = content || '[Imagen]';
-          }
-        }
-      } catch (dlErr) {
-        debugLog(`[${numero}] ❌ Error descargando imagen: ${dlErr.message}`);
-        content = content || '[Imagen]';
-      }
-    } else if (msg.stickerMessage) {
-      content = '';
-      media_type = 'sticker';
-      try {
-        const baileys = await import('@whiskeysockets/baileys');
-        const buffer = await baileys.downloadMediaMessage(message, 'buffer', {}, {
-          logger: console,
-          reuploadRequest: activeSessions[numero]?.sock?.updateMediaMessage,
-        });
-        if (buffer) {
-          const fileName = `media/${numero}/${Date.now()}.webp`;
-          const { error: uploadErr } = await supabase.storage
-            .from('whatsapp-media')
-            .upload(fileName, buffer, { contentType: 'image/webp' });
-          if (!uploadErr) {
-            const { data: urlData } = supabase.storage.from('whatsapp-media').getPublicUrl(fileName);
-            media_url = urlData.publicUrl;
-            debugLog(`[${numero}] 🎭 Sticker subido: ${media_url}`);
-          } else {
-            content = '[Sticker]';
-          }
-        }
-      } catch (dlErr) {
-        debugLog(`[${numero}] ❌ Error descargando sticker: ${dlErr.message}`);
-        content = '[Sticker]';
-      }
-    } else if (msg.videoMessage) {
-      content = msg.videoMessage.caption || '';
-      media_type = 'video';
-      try {
-        const baileys = await import('@whiskeysockets/baileys');
-        const buffer = await baileys.downloadMediaMessage(message, 'buffer', {}, {
-          logger: console,
-          reuploadRequest: activeSessions[numero]?.sock?.updateMediaMessage,
-        });
-        if (buffer) {
-          const ext = msg.videoMessage.mimetype?.split('/')[1] || 'mp4';
-          const fileName = `media/${numero}/${Date.now()}.${ext}`;
-          const { error: uploadErr } = await supabase.storage
-            .from('whatsapp-media')
-            .upload(fileName, buffer, { contentType: msg.videoMessage.mimetype || 'video/mp4' });
-          if (!uploadErr) {
-            const { data: urlData } = supabase.storage.from('whatsapp-media').getPublicUrl(fileName);
-            media_url = urlData.publicUrl;
-            debugLog(`[${numero}] 🎬 Video subido: ${media_url}`);
-          } else {
-            content = content || '[Video]';
-          }
-        }
-      } catch (dlErr) {
-        debugLog(`[${numero}] ❌ Error descargando video: ${dlErr.message}`);
-        content = content || '[Video]';
-      }
-    } else if (msg.audioMessage) {
-      content = '';
-      media_type = 'audio';
-      try {
-        const baileys = await import('@whiskeysockets/baileys');
-        const buffer = await baileys.downloadMediaMessage(message, 'buffer', {}, {
-          logger: console,
-          reuploadRequest: activeSessions[numero]?.sock?.updateMediaMessage,
-        });
-        if (buffer) {
-          const fileName = `media/${numero}/${Date.now()}.ogg`;
-          const { error: uploadErr } = await supabase.storage
-            .from('whatsapp-media')
-            .upload(fileName, buffer, { contentType: 'audio/ogg' });
-          if (!uploadErr) {
-            const { data: urlData } = supabase.storage.from('whatsapp-media').getPublicUrl(fileName);
-            media_url = urlData.publicUrl;
-            debugLog(`[${numero}] 🎵 Audio subido: ${media_url}`);
-          } else {
-            content = '[Audio]';
-          }
-        }
-      } catch (dlErr) {
-        debugLog(`[${numero}] ❌ Error descargando audio: ${dlErr.message}`);
-        content = '[Audio]';
-      }
-    } else if (msg.documentMessage) {
-      content = msg.documentMessage.fileName || '[Documento]';
-      media_type = 'document';
-      try {
-        const baileys = await import('@whiskeysockets/baileys');
-        const buffer = await baileys.downloadMediaMessage(message, 'buffer', {}, {
-          logger: console,
-          reuploadRequest: activeSessions[numero]?.sock?.updateMediaMessage,
-        });
-        if (buffer) {
-          const ext = msg.documentMessage.fileName?.split('.').pop() || 'pdf';
-          const fileName = `media/${numero}/${Date.now()}_${msg.documentMessage.fileName || 'doc.' + ext}`;
-          const { error: uploadErr } = await supabase.storage
-            .from('whatsapp-media')
-            .upload(fileName, buffer, { contentType: msg.documentMessage.mimetype || 'application/octet-stream' });
-          if (!uploadErr) {
-            const { data: urlData } = supabase.storage.from('whatsapp-media').getPublicUrl(fileName);
-            media_url = urlData.publicUrl;
-            debugLog(`[${numero}] 📎 Documento subido: ${media_url}`);
-          } else {
-            content = `[Documento: ${msg.documentMessage.fileName}]`;
-          }
-        }
-      } catch (dlErr) {
-        debugLog(`[${numero}] ❌ Error descargando documento: ${dlErr.message}`);
-        content = `[Documento: ${msg.documentMessage.fileName}]`;
-      }
-    } else if (msg.locationMessage) {
-      content = `[Ubicacion: ${msg.locationMessage.degreesLatitude}, ${msg.locationMessage.degreesLongitude}]`;
-      media_type = 'location';
-    } else if (msg.contactMessage) {
-      content = `[Contacto: ${msg.contactMessage.displayName || 'Sin nombre'}]`;
-    } else if (msg.reactionMessage) {
-      content = msg.reactionMessage.text || '';
-      media_type = 'reaction';
+    if (message.message.conversation) {
+      content = message.message.conversation;
+    } else if (message.message.extendedTextMessage) {
+      content = message.message.extendedTextMessage.text;
+    } else if (message.message.imageMessage) {
+      content = message.message.imageMessage.caption || '[Imagen]';
+    } else if (message.message.documentMessage) {
+      content = `[Documento: ${message.message.documentMessage.fileName}]`;
+    } else if (message.message.audioMessage) {
+      content = '[Audio]';
+    } else if (message.message.videoMessage) {
+      content = message.message.videoMessage.caption || '[Video]';
+    } else if (message.message.stickerMessage) {
+      content = '[Sticker]';
+    } else if (message.message.locationMessage) {
+      content = '[Ubicacion]';
+    } else if (message.message.contactMessage) {
+      content = '[Contacto]';
     } else {
       content = '[Mensaje no soportado]';
     }
 
-    // Don't save empty reactions
-    if (media_type === 'reaction' && !content) return;
-
-    // Build insert object
-    const insertData = {
-      contact_id: contact.id,
-      whatsapp_account_id: account.id,
-      content: content || '',
-      direction: isFromMe ? 'outbound' : 'inbound',
-      sender_type: isFromMe ? 'agent' : 'customer',
-    };
-    if (media_url) insertData.media_url = media_url;
-    if (media_type) insertData.media_type = media_type;
-
     // Insert message
-    const { error: msgError } = await supabase
+    await supabase
       .from('wmp_messages')
-      .insert(insertData);
+      .insert({
+        contact_id: contact.id,
+        whatsapp_account_id: account.id,
+        content: content,
+        direction: 'inbound',
+        sender_type: 'contact',
+      });
 
-    if (msgError) {
-      console.error(`❌ Error insertando mensaje:`, msgError);
-      return;
-    }
+    // Update contact: last_message_at and unread_count
+    const { data: unreadData } = await supabase
+      .from('wmp_messages')
+      .select('id', { count: 'exact', head: true })
+      .eq('contact_id', contact.id)
+      .eq('direction', 'inbound');
 
-    // Update last_message_at always, but only increment unread for inbound
-    if (!isFromMe) {
-      const { data: currentContact } = await supabase
-        .from('wmp_contacts')
-        .select('unread_count')
-        .eq('id', contact.id)
-        .single();
-
-      await supabase
-        .from('wmp_contacts')
-        .update({
-          last_message_at: new Date().toISOString(),
-          unread_count: ((currentContact?.unread_count || 0) + 1),
-        })
-        .eq('id', contact.id);
-    } else {
-      // Just update last_message_at for outbound
-      await supabase
-        .from('wmp_contacts')
-        .update({ last_message_at: new Date().toISOString() })
-        .eq('id', contact.id);
-    }
+    await supabase
+      .from('wmp_contacts')
+      .update({
+        last_message_at: new Date().toISOString(),
+        unread_count: (unreadData?.length || 0),
+      })
+      .eq('id', contact.id);
 
     // Notify SSE clients
     broadcast('new_message', {
@@ -816,255 +548,8 @@ async function guardarMensaje(numero, message, isFromMe = false) {
       contact_id: contact.id,
     });
 
-    // Only trigger AI for inbound messages
-    if (!isFromMe) {
-      handleAIResponse(numero, contact.id, account.id, content).catch(err => {
-        debugLog(`[${numero}] AI handler error: ${err.message}`);
-      });
-    }
-
   } catch (error) {
     console.error('Error guardando mensaje:', error);
-  }
-}
-
-// === AI INTEGRATION ===
-
-function isWithinBusinessHours() {
-  const now = new Date();
-  // Convert to Eastern Time
-  const eastern = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
-  const day = eastern.getDay(); // 0=Sunday
-  const hour = eastern.getHours();
-  const minute = eastern.getMinutes();
-  const time = hour * 60 + minute;
-
-  // Saturday: 9am-6pm
-  if (day === 6) return time >= 540 && time < 1080;
-  // Sunday-Friday: 9am-9pm
-  return time >= 540 && time < 1260;
-}
-
-async function getAIResponse(contactId, accountId, incomingMessage) {
-  try {
-    // Get AI config
-    const { data: aiConfig } = await supabase
-      .from('wmp_ai_config')
-      .select('*')
-      .eq('is_active', true)
-      .single();
-
-    if (!aiConfig || !aiConfig.api_key) {
-      debugLog('AI not configured or no API key');
-      return null;
-    }
-
-    const withinHours = isWithinBusinessHours();
-
-    // If within business hours and copilot mode, just save suggestion (don't auto-reply)
-    if (withinHours && aiConfig.copilot_enabled && !aiConfig.auto_reply_when_absent) {
-      debugLog('Within business hours, copilot mode — skipping auto-reply');
-      return null;
-    }
-
-    // If within business hours and copilot enabled, save suggestion for agent
-    if (withinHours && aiConfig.copilot_enabled) {
-      debugLog('Within business hours, generating suggestion for agent');
-    }
-
-    // Get knowledge base
-    const { data: knowledge } = await supabase
-      .from('wmp_ai_knowledge_base')
-      .select('title, content');
-
-    // Get recent messages for context
-    const { data: messages } = await supabase
-      .from('wmp_messages')
-      .select('content, direction, sender_type, created_at')
-      .eq('contact_id', contactId)
-      .order('created_at', { ascending: false })
-      .limit(20);
-
-    const sortedMessages = [...(messages || [])].reverse();
-
-    // Get contact info
-    const { data: contact } = await supabase
-      .from('wmp_contacts')
-      .select('name, phone_number')
-      .eq('id', contactId)
-      .single();
-
-    // Build conversation for OpenAI
-    const conversationHistory = sortedMessages.map(m => ({
-      role: m.direction === 'inbound' ? 'user' : 'assistant',
-      content: m.content || '',
-    }));
-
-    const knowledgeContext = (knowledge || [])
-      .map(k => `## ${k.title}\n${k.content}`)
-      .join('\n\n');
-
-    const systemPrompt = `${aiConfig.system_prompt}\n\nBASE DE CONOCIMIENTO:\n${knowledgeContext}\n\nINFORMACIÓN DEL CLIENTE:\n- Nombre: ${contact?.name || 'Desconocido'}\n- Teléfono: ${contact?.phone_number || 'No disponible'}`;
-
-    // Call OpenAI
-    const openaiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${aiConfig.api_key}`,
-      },
-      body: JSON.stringify({
-        model: aiConfig.model || 'gpt-4o-mini',
-        temperature: aiConfig.temperature || 0.7,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          ...conversationHistory,
-        ],
-        max_tokens: 500,
-      }),
-    });
-
-    if (!openaiResponse.ok) {
-      const err = await openaiResponse.text();
-      debugLog(`OpenAI error: ${err}`);
-      return null;
-    }
-
-    const data = await openaiResponse.json();
-    const suggestion = data.choices?.[0]?.message?.content || '';
-
-    if (!suggestion) return null;
-
-    return { suggestion, withinHours, autoReply: !withinHours && aiConfig.auto_reply_when_absent };
-  } catch (error) {
-    debugLog(`AI error: ${error.message}`);
-    return null;
-  }
-}
-
-async function handleAIResponse(numero, contactId, accountId, content) {
-  const aiResult = await getAIResponse(contactId, accountId, content);
-  if (!aiResult) return;
-
-  const { suggestion, withinHours, autoReply } = aiResult;
-
-  if (autoReply) {
-    // Outside business hours — send automatically
-    debugLog(`[${numero}] AI auto-reply: ${suggestion.substring(0, 50)}...`);
-
-    const session = activeSessions[numero];
-    if (!session?.socket) {
-      debugLog(`[${numero}] No active session for AI auto-reply`);
-      return;
-    }
-
-    // Get contact to find JID
-    const { data: contact } = await supabase
-      .from('wmp_contacts')
-      .select('phone_number, lid')
-      .eq('id', contactId)
-      .single();
-
-    if (!contact) return;
-
-    const phoneOrLid = contact.lid || contact.phone_number;
-    const isLid = phoneOrLid.length >= 15;
-    const jid = isLid ? `${phoneOrLid}@lid` : `${phoneOrLid}@s.whatsapp.net`;
-
-    try {
-      // Parse and extract customer data from AI response
-      const dataMatch = suggestion.match(/\[DATOS:\s*(.+?)\]/);
-      let cleanSuggestion = suggestion.replace(/\[DATOS:\s*.+?\]/, '').trim();
-
-      if (dataMatch) {
-        const dataStr = dataMatch[1];
-        const updates = {};
-        const fieldMap = {
-          'nombre': 'name',
-          'telefono': 'phone_number',
-          'email': 'email',
-          'destino_pais': 'destination_country',
-          'destino_ciudad': 'destination_city',
-          'zip': 'zip_code',
-          'usa_zip': 'usa_zip_code',
-          'mx_zip': 'mx_zip_code',
-          'origen_estado': 'origin_state',
-          'origen_ciudad': 'origin_city',
-          'servicio': 'service_type',
-          'notas': 'notes',
-        };
-
-        for (const pair of dataStr.split(',')) {
-          const [key, ...valParts] = pair.split('=');
-          const val = valParts.join('=').trim();
-          const dbField = fieldMap[key.trim()];
-          if (dbField && val) updates[dbField] = val;
-        }
-
-        if (Object.keys(updates).length > 0) {
-          // Don't overwrite phone_number if contact already has a real one
-          if (updates.phone_number) {
-            const { data: existing } = await supabase
-              .from('wmp_contacts')
-              .select('phone_number')
-              .eq('id', contactId)
-              .single();
-            if (existing?.phone_number && existing.phone_number.length < 15) {
-              delete updates.phone_number;
-            }
-          }
-          if (Object.keys(updates).length > 0) {
-            await supabase.from('wmp_contacts').update(updates).eq('id', contactId);
-            debugLog(`[${numero}] 📋 Client data saved: ${JSON.stringify(updates)}`);
-          }
-        }
-      }
-
-      // Separate TAREAS PARA AGENTE from client-visible message
-      let clientMessage = (cleanSuggestion || suggestion);
-      const taskMatch = clientMessage.match(/TAREAS?\s*PARA\s*AGENTE[S]?:\s*([\s\S]*?)(?=\n\n|$)/i);
-      let agentTask = null;
-      if (taskMatch) {
-        agentTask = taskMatch[0].trim();
-        clientMessage = clientMessage.replace(taskMatch[0], '').trim();
-      }
-
-      // Send only client-visible part to WhatsApp
-      if (clientMessage) {
-        await session.socket.sendMessage(jid, { text: clientMessage });
-      }
-
-      // Save client-visible message to DB
-      await supabase.from('wmp_messages').insert({
-        contact_id: contactId,
-        whatsapp_account_id: accountId,
-        content: clientMessage || cleanSuggestion || suggestion,
-        direction: 'outbound',
-        sender_type: 'ai',
-      });
-
-      // If there's a task for agents, send it to internal chat
-      if (agentTask) {
-        const contactName = contact.name || contact.phone_number || 'Desconocido';
-        await supabase.from('wmp_internal_messages').insert({
-          sender_email: 'paquita@paquetex.net',
-          sender_name: 'Paquita (IA)',
-          content: `📋 ${agentTask}\n\n👤 Cliente: ${contactName}\n📞 Tel: ${contact.phone_number || 'No disponible'}`,
-        });
-        debugLog(`[${numero}] 📋 Task enviado al chat interno`);
-      }
-
-      debugLog(`[${numero}] ✅ AI auto-reply sent`);
-    } catch (err) {
-      debugLog(`[${numero}] ❌ AI auto-reply failed: ${err.message}`);
-    }
-  } else if (withinHours) {
-    // Within business hours — save suggestion for agent
-    debugLog(`[${numero}] AI suggestion saved for agent`);
-    broadcast('ai_suggestion', {
-      contact_id: contactId,
-      suggestion: suggestion,
-    });
   }
 }
 
@@ -1282,12 +767,7 @@ app.post('/api/whatsapp/enviar', async (req, res) => {
       });
     }
 
-    const cleanNum = contacto.replace('+', '');
-    // Real phone numbers are max 14 digits. LIDs are 15+ digits.
-    const isLidNumber = cleanNum.length >= 15;
-    const jid = isLidNumber ? `${cleanNum}@lid` : `${cleanNum}@s.whatsapp.net`;
-    debugLog(`[${numero}] Enviando a JID: ${jid} (isLid: ${isLidNumber}, digits: ${cleanNum.length})`);
-    debugLog(`[${numero}] Enviando a JID: ${jid}`);
+    const jid = contacto.replace('+', '') + '@s.whatsapp.net';
     const sentMsg = await session.socket.sendMessage(jid, { text: mensaje });
 
     const account = await findAccount(numero);
@@ -1324,6 +804,218 @@ app.post('/api/whatsapp/enviar', async (req, res) => {
       mensajeId: sentMsg.key.id
     });
   } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/whatsapp/enviar-media', async (req, res) => {
+  const numero = normalizePhone(req.body.numero || '');
+  const { contacto, mediaUrl, mediaType, caption, fileName, mimeType } = req.body;
+
+  if (!numero || !contacto || !mediaUrl) {
+    return res.status(400).json({
+      error: 'Faltan parámetros: numero, contacto, mediaUrl'
+    });
+  }
+
+  try {
+    const session = activeSessions[numero];
+
+    if (!session || !session.socket) {
+      return res.status(400).json({
+        error: `No hay sesión activa para ${numero}`
+      });
+    }
+
+    const jid = contacto.replace('+', '') + '@s.whatsapp.net';
+
+    // Download media from URL
+    const mediaResponse = await fetch(mediaUrl);
+    if (!mediaResponse.ok) {
+      return res.status(400).json({ error: 'No se pudo descargar el archivo' });
+    }
+    const mediaBuffer = Buffer.from(await mediaResponse.arrayBuffer());
+
+    // Build message based on media type
+    let messageContent;
+    switch (mediaType) {
+      case 'image':
+        messageContent = {
+          image: mediaBuffer,
+          caption: caption || undefined,
+          mimetype: mimeType || 'image/jpeg',
+        };
+        break;
+      case 'video':
+        messageContent = {
+          video: mediaBuffer,
+          caption: caption || undefined,
+          mimetype: mimeType || 'video/mp4',
+        };
+        break;
+      case 'audio':
+        messageContent = {
+          audio: mediaBuffer,
+          mimetype: mimeType || 'audio/mpeg',
+          ptt: false,
+        };
+        break;
+      case 'document':
+      default:
+        messageContent = {
+          document: mediaBuffer,
+          mimetype: mimeType || 'application/octet-stream',
+          fileName: fileName || 'archivo',
+        };
+        break;
+    }
+
+    const sentMsg = await session.socket.sendMessage(jid, messageContent);
+
+    // Save to DB
+    const account = await findAccount(numero);
+    const cleanContacto = contacto.replace('+', '');
+
+    if (account) {
+      const { data: contact } = await supabase
+        .from('wmp_contacts')
+        .select('id')
+        .eq('phone_number', cleanContacto)
+        .eq('whatsapp_account_id', account.id)
+        .single();
+
+      if (contact) {
+        await supabase
+          .from('wmp_messages')
+          .insert({
+            contact_id: contact.id,
+            whatsapp_account_id: account.id,
+            content: caption || fileName || `[${mediaType}]`,
+            media_url: mediaUrl,
+            media_type: mediaType,
+            direction: 'outbound',
+            sender_type: 'agent',
+          });
+
+        await supabase
+          .from('wmp_contacts')
+          .update({ last_message_at: new Date().toISOString() })
+          .eq('id', contact.id);
+      }
+    }
+
+    res.json({
+      success: true,
+      mensajeId: sentMsg.key.id
+    });
+  } catch (error) {
+    console.error('Error enviando media:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/whatsapp/enviar-media', async (req, res) => {
+  const numero = normalizePhone(req.body.numero || '');
+  const { contacto, mediaUrl, mediaType, caption, fileName, mimeType } = req.body;
+
+  if (!numero || !contacto || !mediaUrl) {
+    return res.status(400).json({
+      error: 'Faltan parámetros: numero, contacto, mediaUrl'
+    });
+  }
+
+  try {
+    const session = activeSessions[numero];
+
+    if (!session || !session.socket) {
+      return res.status(400).json({
+        error: `No hay sesión activa para ${numero}`
+      });
+    }
+
+    const jid = contacto.replace('+', '') + '@s.whatsapp.net';
+
+    // Download media from URL
+    const mediaResponse = await fetch(mediaUrl);
+    if (!mediaResponse.ok) {
+      return res.status(400).json({ error: 'No se pudo descargar el archivo' });
+    }
+    const mediaBuffer = Buffer.from(await mediaResponse.arrayBuffer());
+
+    // Build message based on media type
+    let messageContent;
+    switch (mediaType) {
+      case 'image':
+        messageContent = {
+          image: mediaBuffer,
+          caption: caption || undefined,
+          mimetype: mimeType || 'image/jpeg',
+        };
+        break;
+      case 'video':
+        messageContent = {
+          video: mediaBuffer,
+          caption: caption || undefined,
+          mimetype: mimeType || 'video/mp4',
+        };
+        break;
+      case 'audio':
+        messageContent = {
+          audio: mediaBuffer,
+          mimetype: mimeType || 'audio/mpeg',
+          ptt: false,
+        };
+        break;
+      case 'document':
+      default:
+        messageContent = {
+          document: mediaBuffer,
+          mimetype: mimeType || 'application/octet-stream',
+          fileName: fileName || 'archivo',
+        };
+        break;
+    }
+
+    const sentMsg = await session.socket.sendMessage(jid, messageContent);
+
+    // Save to DB
+    const account = await findAccount(numero);
+    const cleanContacto = contacto.replace('+', '');
+
+    if (account) {
+      const { data: contact } = await supabase
+        .from('wmp_contacts')
+        .select('id')
+        .eq('phone_number', cleanContacto)
+        .eq('whatsapp_account_id', account.id)
+        .single();
+
+      if (contact) {
+        await supabase
+          .from('wmp_messages')
+          .insert({
+            contact_id: contact.id,
+            whatsapp_account_id: account.id,
+            content: caption || fileName || `[${mediaType}]`,
+            media_url: mediaUrl,
+            media_type: mediaType,
+            direction: 'outbound',
+            sender_type: 'agent',
+          });
+
+        await supabase
+          .from('wmp_contacts')
+          .update({ last_message_at: new Date().toISOString() })
+          .eq('id', contact.id);
+      }
+    }
+
+    res.json({
+      success: true,
+      mensajeId: sentMsg.key.id
+    });
+  } catch (error) {
+    console.error('Error enviando media:', error);
     res.status(500).json({ error: error.message });
   }
 });
