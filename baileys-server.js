@@ -472,10 +472,28 @@ async function guardarMensaje(numero, message) {
     const account = await findAccount(numero);
     if (!account) return;
 
-    const contactNumber = message.key.remoteJid.split('@')[0];
-    const cleanPhone = contactNumber.includes(':')
-      ? contactNumber.split(':')[0]
-      : contactNumber;
+    const remoteJid = message.key.remoteJid;
+    const isLid = remoteJid.endsWith('@lid');
+
+    // For LID messages, try to get real phone from participant or store with LID
+    let cleanPhone;
+    if (isLid) {
+      // Try participant field which may have the real number
+      const participant = message.key.participant;
+      if (participant && participant.endsWith('@s.whatsapp.net')) {
+        cleanPhone = participant.split('@')[0];
+      } else {
+        // Store with LID, will be resolved later
+        cleanPhone = remoteJid.split('@')[0];
+      }
+    } else {
+      const contactNumber = remoteJid.split('@')[0];
+      cleanPhone = contactNumber.includes(':')
+        ? contactNumber.split(':')[0]
+        : contactNumber;
+    }
+
+    debugLog(`[${numero}] Resolved phone: ${cleanPhone} (isLid: ${isLid}, jid: ${remoteJid})`);
 
     // Find or create contact
     let { data: contact } = await supabase
