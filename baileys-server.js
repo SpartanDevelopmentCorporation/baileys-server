@@ -583,40 +583,180 @@ async function guardarMensaje(numero, message) {
 
     if (!contact) return;
 
-    // Extract message content
+    // Extract message content and media
     let content = '';
-    if (message.message.conversation) {
-      content = message.message.conversation;
-    } else if (message.message.extendedTextMessage) {
-      content = message.message.extendedTextMessage.text;
-    } else if (message.message.imageMessage) {
-      content = message.message.imageMessage.caption || '[Imagen]';
-    } else if (message.message.documentMessage) {
-      content = `[Documento: ${message.message.documentMessage.fileName}]`;
-    } else if (message.message.audioMessage) {
-      content = '[Audio]';
-    } else if (message.message.videoMessage) {
-      content = message.message.videoMessage.caption || '[Video]';
-    } else if (message.message.stickerMessage) {
-      content = '[Sticker]';
-    } else if (message.message.locationMessage) {
-      content = '[Ubicacion]';
-    } else if (message.message.contactMessage) {
-      content = '[Contacto]';
+    let media_url = null;
+    let media_type = null;
+    const msg = message.message;
+
+    if (msg.conversation) {
+      content = msg.conversation;
+    } else if (msg.extendedTextMessage) {
+      content = msg.extendedTextMessage.text;
+    } else if (msg.imageMessage) {
+      content = msg.imageMessage.caption || '';
+      media_type = 'image';
+      try {
+        const baileys = await import('@whiskeysockets/baileys');
+        const buffer = await baileys.downloadMediaMessage(message, 'buffer', {}, {
+          logger: console,
+          reuploadRequest: activeSessions[numero]?.sock?.updateMediaMessage,
+        });
+        if (buffer) {
+          const ext = msg.imageMessage.mimetype?.split('/')[1] || 'jpg';
+          const fileName = `media/${numero}/${Date.now()}.${ext}`;
+          const { error: uploadErr } = await supabase.storage
+            .from('whatsapp-media')
+            .upload(fileName, buffer, { contentType: msg.imageMessage.mimetype || 'image/jpeg' });
+          if (!uploadErr) {
+            const { data: urlData } = supabase.storage.from('whatsapp-media').getPublicUrl(fileName);
+            media_url = urlData.publicUrl;
+            debugLog(`[${numero}] 📷 Imagen subida: ${media_url}`);
+          } else {
+            debugLog(`[${numero}] ❌ Error subiendo imagen: ${uploadErr.message}`);
+            content = content || '[Imagen]';
+          }
+        }
+      } catch (dlErr) {
+        debugLog(`[${numero}] ❌ Error descargando imagen: ${dlErr.message}`);
+        content = content || '[Imagen]';
+      }
+    } else if (msg.stickerMessage) {
+      content = '';
+      media_type = 'sticker';
+      try {
+        const baileys = await import('@whiskeysockets/baileys');
+        const buffer = await baileys.downloadMediaMessage(message, 'buffer', {}, {
+          logger: console,
+          reuploadRequest: activeSessions[numero]?.sock?.updateMediaMessage,
+        });
+        if (buffer) {
+          const fileName = `media/${numero}/${Date.now()}.webp`;
+          const { error: uploadErr } = await supabase.storage
+            .from('whatsapp-media')
+            .upload(fileName, buffer, { contentType: 'image/webp' });
+          if (!uploadErr) {
+            const { data: urlData } = supabase.storage.from('whatsapp-media').getPublicUrl(fileName);
+            media_url = urlData.publicUrl;
+            debugLog(`[${numero}] 🎭 Sticker subido: ${media_url}`);
+          } else {
+            content = '[Sticker]';
+          }
+        }
+      } catch (dlErr) {
+        debugLog(`[${numero}] ❌ Error descargando sticker: ${dlErr.message}`);
+        content = '[Sticker]';
+      }
+    } else if (msg.videoMessage) {
+      content = msg.videoMessage.caption || '';
+      media_type = 'video';
+      try {
+        const baileys = await import('@whiskeysockets/baileys');
+        const buffer = await baileys.downloadMediaMessage(message, 'buffer', {}, {
+          logger: console,
+          reuploadRequest: activeSessions[numero]?.sock?.updateMediaMessage,
+        });
+        if (buffer) {
+          const ext = msg.videoMessage.mimetype?.split('/')[1] || 'mp4';
+          const fileName = `media/${numero}/${Date.now()}.${ext}`;
+          const { error: uploadErr } = await supabase.storage
+            .from('whatsapp-media')
+            .upload(fileName, buffer, { contentType: msg.videoMessage.mimetype || 'video/mp4' });
+          if (!uploadErr) {
+            const { data: urlData } = supabase.storage.from('whatsapp-media').getPublicUrl(fileName);
+            media_url = urlData.publicUrl;
+            debugLog(`[${numero}] 🎬 Video subido: ${media_url}`);
+          } else {
+            content = content || '[Video]';
+          }
+        }
+      } catch (dlErr) {
+        debugLog(`[${numero}] ❌ Error descargando video: ${dlErr.message}`);
+        content = content || '[Video]';
+      }
+    } else if (msg.audioMessage) {
+      content = '';
+      media_type = 'audio';
+      try {
+        const baileys = await import('@whiskeysockets/baileys');
+        const buffer = await baileys.downloadMediaMessage(message, 'buffer', {}, {
+          logger: console,
+          reuploadRequest: activeSessions[numero]?.sock?.updateMediaMessage,
+        });
+        if (buffer) {
+          const fileName = `media/${numero}/${Date.now()}.ogg`;
+          const { error: uploadErr } = await supabase.storage
+            .from('whatsapp-media')
+            .upload(fileName, buffer, { contentType: 'audio/ogg' });
+          if (!uploadErr) {
+            const { data: urlData } = supabase.storage.from('whatsapp-media').getPublicUrl(fileName);
+            media_url = urlData.publicUrl;
+            debugLog(`[${numero}] 🎵 Audio subido: ${media_url}`);
+          } else {
+            content = '[Audio]';
+          }
+        }
+      } catch (dlErr) {
+        debugLog(`[${numero}] ❌ Error descargando audio: ${dlErr.message}`);
+        content = '[Audio]';
+      }
+    } else if (msg.documentMessage) {
+      content = msg.documentMessage.fileName || '[Documento]';
+      media_type = 'document';
+      try {
+        const baileys = await import('@whiskeysockets/baileys');
+        const buffer = await baileys.downloadMediaMessage(message, 'buffer', {}, {
+          logger: console,
+          reuploadRequest: activeSessions[numero]?.sock?.updateMediaMessage,
+        });
+        if (buffer) {
+          const ext = msg.documentMessage.fileName?.split('.').pop() || 'pdf';
+          const fileName = `media/${numero}/${Date.now()}_${msg.documentMessage.fileName || 'doc.' + ext}`;
+          const { error: uploadErr } = await supabase.storage
+            .from('whatsapp-media')
+            .upload(fileName, buffer, { contentType: msg.documentMessage.mimetype || 'application/octet-stream' });
+          if (!uploadErr) {
+            const { data: urlData } = supabase.storage.from('whatsapp-media').getPublicUrl(fileName);
+            media_url = urlData.publicUrl;
+            debugLog(`[${numero}] 📎 Documento subido: ${media_url}`);
+          } else {
+            content = `[Documento: ${msg.documentMessage.fileName}]`;
+          }
+        }
+      } catch (dlErr) {
+        debugLog(`[${numero}] ❌ Error descargando documento: ${dlErr.message}`);
+        content = `[Documento: ${msg.documentMessage.fileName}]`;
+      }
+    } else if (msg.locationMessage) {
+      content = `[Ubicacion: ${msg.locationMessage.degreesLatitude}, ${msg.locationMessage.degreesLongitude}]`;
+      media_type = 'location';
+    } else if (msg.contactMessage) {
+      content = `[Contacto: ${msg.contactMessage.displayName || 'Sin nombre'}]`;
+    } else if (msg.reactionMessage) {
+      content = msg.reactionMessage.text || '';
+      media_type = 'reaction';
     } else {
       content = '[Mensaje no soportado]';
     }
 
+    // Don't save empty reactions
+    if (media_type === 'reaction' && !content) return;
+
+    // Build insert object
+    const insertData = {
+      contact_id: contact.id,
+      whatsapp_account_id: account.id,
+      content: content || '',
+      direction: 'inbound',
+      sender_type: 'customer',
+    };
+    if (media_url) insertData.media_url = media_url;
+    if (media_type) insertData.media_type = media_type;
+
     // Insert message
     const { error: msgError } = await supabase
       .from('wmp_messages')
-      .insert({
-        contact_id: contact.id,
-        whatsapp_account_id: account.id,
-        content: content,
-        direction: 'inbound',
-        sender_type: 'customer',
-      });
+      .insert(insertData);
 
     if (msgError) {
       console.error(`❌ Error insertando mensaje:`, msgError);
