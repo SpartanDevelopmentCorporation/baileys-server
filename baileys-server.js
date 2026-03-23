@@ -801,7 +801,10 @@ app.post('/api/whatsapp/enviar', async (req, res) => {
       });
     }
 
-    const jid = contacto.replace('+', '') + '@s.whatsapp.net';
+    const cleanNum = contacto.replace('+', '');
+    // If number is longer than 15 digits, it's a LID
+    const jid = cleanNum.length > 15 ? `${cleanNum}@lid` : `${cleanNum}@s.whatsapp.net`;
+    debugLog(`[${numero}] Enviando a JID: ${jid}`);
     const sentMsg = await session.socket.sendMessage(jid, { text: mensaje });
 
     const account = await findAccount(numero);
